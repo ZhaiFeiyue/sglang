@@ -2,10 +2,10 @@ import logging
 import os
 import time
 from typing import List, Optional, Tuple
-
+import collections
 import torch
 from huggingface_hub import snapshot_download
-
+from typing import List, Optional, Union
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -31,6 +31,74 @@ from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
+
+class LRUCache:
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.queue = collections.OrderedDict()
+        self.total = 0
+        self.hit = 0
+        for idx, i in enumerate(range(self.capacity)):
+            # key: hot_table_slot
+            self.put(i, idx)
+
+    def get(self, key):
+        if key not in self.queue:
+            return -1
+        value = self.queue.pop(key)
+        self.queue[key] = value
+        return self.queue[key]
+
+    def in_cache(self, key):
+        self.total += 1
+        if key in self.queue:
+            self.hit +=1
+            return True
+        return False
+
+    def get_index(self):
+        if len(self.queue.items()) == self.capacity:
+            return self.queue.popitem(last=False)
+        return None
+
+    def put(self, key, value):
+        if key in self.queue:
+            self.queue.pop(key)
+        self.queue[key] = value
+
+class HotVocabTable:
+    def __init__(self, num_dynamic_tokens=256):
+        self.cache = LRUCache(num_dynamic_tokens)
+        self.id_map = {'gather':[], 'scatter':[]}
+
+
+    def add_token(self, token_ids: torch.Tensor) -> None:
+        token_ids = token_ids.cpu().tolist()
+        self.id_map['scatter'].clear()
+        self.id_map['gather'].clear()
+
+        for item in token_ids:
+            if self.cache.in_cache(item):
+                self.cache.get(item)
+                continue
+
+            idx = self.cache.get_index()
+
+            self.id_map['scatter'].append(idx[1])
+            self.id_map['gather'].append(item)
+            self.cache.put(item, idx[1])
+
+
+    def update_table(self, hot_table, ori_table):
+        if len(self.id_map['gather']) != 0:
+            data = ori_table[self.id_map['gather'], :].unsqueeze(0)
+            hot_table[self.id_map['scatter']] = data
+
+    def get_hot_token_ids(self):
+        data = sorted(self.cache.queue.items(), key=lambda i: i[-1])
+        token_ids = torch.tensor([k for k, _ in data], dtype=torch.int32, device="cuda")
+        return token_ids
 
 class EAGLEWorker(TpModelWorker):
 
@@ -72,8 +140,10 @@ class EAGLEWorker(TpModelWorker):
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
+            self.hot_table = HotVocabTable(768)
         else:
             self.hot_token_id = None
+
 
         # Init draft worker
         super().__init__(
@@ -91,7 +161,8 @@ class EAGLEWorker(TpModelWorker):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if self.hot_token_id is not None:
             head = head.clone()
-            self.hot_token_id = self.hot_token_id.to(head.device)
+            # self.hot_token_id = self.hot_token_id.to(head.device)
+            self.hot_token_id = self.hot_table.get_hot_token_ids()
             head.data = head.data[self.hot_token_id]
         self.draft_model_runner.model.set_embed_and_head(embed, head)
         self.draft_model_runner.server_args.disable_cuda_graph = (
@@ -184,7 +255,9 @@ class EAGLEWorker(TpModelWorker):
             # if it is None, means all requests are finished
             if batch.spec_info.verified_id is not None:
                 self.forward_draft_extend_after_decode(batch)
-
+            self.hot_table.add_token(verify_output.verified_id)
+            self.hot_table.update_table(self.draft_model_runner.model.lm_head.weight, self.target_worker.model_runner.model.lm_head.weight)
+            self.hot_token_id = self.hot_table.get_hot_token_ids()
             return (
                 logits_output,
                 verify_output.verified_id,
