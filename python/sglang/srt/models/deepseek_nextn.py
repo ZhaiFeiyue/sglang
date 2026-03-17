@@ -85,6 +85,33 @@ class DeepseekModelNextN(nn.Module):
             )
             quant_config = None
 
+        if quant_config is not None and quant_config.get_name() == "quark":
+            mtp_layer_prefix = f"model.layers.{config.num_hidden_layers}"
+            mtp_excluded = any(
+                mtp_layer_prefix in entry or "model.decoder" in entry
+                for entry in quant_config.exclude_layers
+            )
+            if not mtp_excluded:
+                logger.warning(
+                    "Overriding DeepseekV3ForCausalLMNextN quant config: "
+                    "using Fp8Config for Quark MTP layer."
+                )
+                quant_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
+                moe_quant_config_override = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
+            else:
+                logger.warning(
+                    "MTP layer excluded from Quark quantization, "
+                    "using unquantized (BF16) MTP layer."
+                )
+                quant_config = None
+                moe_quant_config_override = None
+
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -213,6 +240,21 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        if quant_config is not None and quant_config.get_name() == "quark":
+            mtp_layer_prefix = f"model.layers.{config.num_hidden_layers}"
+            mtp_excluded = any(
+                mtp_layer_prefix in entry or "model.decoder" in entry
+                for entry in quant_config.exclude_layers
+            )
+            if not mtp_excluded:
+                quant_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
+                self.quant_config = quant_config
+            else:
+                quant_config = None
+                self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
