@@ -550,7 +550,9 @@ class AiterAttnBackend(AttentionBackend):
     ):
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
-        v_head_dim = layer.v_head_dim
+        # Use actual tensor dim to handle MHA layers that may have different
+        # v_head_dim than the looked-up MLA layer (e.g. DeepSeek layer 0).
+        v_head_dim = v.shape[-1]
 
         if q.dtype != fp8_dtype:
             q = q.to(fp8_dtype)
@@ -2057,7 +2059,12 @@ class AiterAttnBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+                # Force no-prefix path when KV cache is not saved (e.g. DeepSeek
+                # MHA layer 0), since the KV pool has MLA-formatted buffers that
+                # would cause dimension mismatches in the cached-prefix path.
+                extend_no_prefix = (
+                    not any(forward_batch.extend_prefix_lens_cpu) or not save_kv_cache
+                )
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if _use_fp8_prefill_attn:
                         output = self.mla_fp8_prefill_attn(

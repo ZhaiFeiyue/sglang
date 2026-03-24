@@ -755,7 +755,7 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
-def aiter_w8a8_block_fp8_linear(
+def _aiter_w8a8_block_fp8_linear_impl(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -763,15 +763,12 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # if input_scale not None, input is quanted
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
@@ -801,6 +798,36 @@ def aiter_w8a8_block_fp8_linear(
     return output.to(
         dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
     ).view(*output_shape)
+
+
+# Register as custom_op so torch.compile/dynamo can handle FakeTensor
+# shape propagation without tracing into aiter's GEMM internals.
+@torch.library.custom_op("sglang::aiter_w8a8_block_fp8_linear", mutates_args=())
+def aiter_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return _aiter_w8a8_block_fp8_linear_impl(
+        input, weight, block_size, weight_scale, input_scale, bias
+    )
+
+
+@aiter_w8a8_block_fp8_linear.register_fake
+def _aiter_w8a8_block_fp8_linear_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    return input.new_empty(output_shape, dtype=dtype)
 
 
 def triton_w8a8_block_fp8_linear(

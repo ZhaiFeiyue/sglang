@@ -154,6 +154,29 @@ def unified_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
 
+    # When the looked-up layer has different head dimensions than the actual
+    # tensors (e.g. DeepSeek layer 0 MHA vs MLA), create a proxy with
+    # corrected dimensions to avoid shape mismatches in the attention backend.
+    if (
+        key is not None
+        and len(key.shape) == 3
+        and key.shape[-1] != attention_layer.qk_head_dim
+    ):
+        import types
+
+        proxy = types.SimpleNamespace()
+        for attr in dir(attention_layer):
+            if not attr.startswith("_"):
+                try:
+                    setattr(proxy, attr, getattr(attention_layer, attr))
+                except Exception:
+                    pass
+        proxy.qk_head_dim = key.shape[-1]
+        proxy.v_head_dim = value.shape[-1] if value is not None else key.shape[-1]
+        proxy.tp_k_head_num = key.shape[-2]
+        proxy.tp_v_head_num = value.shape[-2] if value is not None else key.shape[-2]
+        attention_layer = proxy
+
     kwargs = {}
     if q_rope is not None:
         kwargs["q_rope"] = q_rope
