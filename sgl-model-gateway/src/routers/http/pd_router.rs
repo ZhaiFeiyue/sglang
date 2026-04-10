@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -13,7 +19,10 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, enabled, error, warn, Level};
+
+static REQ_SENT: AtomicU64 = AtomicU64::new(0);
+static REQ_DONE: AtomicU64 = AtomicU64::new(0);
 
 use super::pd_types::api_path;
 use crate::{
@@ -570,6 +579,17 @@ impl PDRouter {
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
+        if enabled!(Level::DEBUG) {
+            let sent = REQ_SENT.fetch_add(1, Ordering::Relaxed) + 1;
+            let done = REQ_DONE.load(Ordering::Relaxed);
+            debug!(
+                "[REQ_SENT] sent={} done={} inflight={}",
+                sent,
+                done,
+                sent - done
+            );
+        }
+
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
@@ -651,7 +671,7 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    let response = if context.return_logprob {
                         self.process_non_streaming_response(
                             res,
                             status,
@@ -679,7 +699,16 @@ impl PDRouter {
                                 )
                             }
                         }
+                    };
+                    if enabled!(Level::DEBUG) {
+                        let done = REQ_DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                        let sent = REQ_SENT.load(Ordering::Relaxed);
+                        debug!(
+                            "[REQ_DONE] sent={} done={} inflight={}",
+                            sent, done, sent - done
+                        );
                     }
+                    response
                 }
             }
             Err(e) => {
@@ -846,6 +875,7 @@ impl PDRouter {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        let log_done = enabled!(Level::DEBUG);
         tokio::spawn(async move {
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
@@ -865,6 +895,16 @@ impl PDRouter {
                         }
 
                         if is_done {
+                            if log_done {
+                                let done = REQ_DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                                let sent = REQ_SENT.load(Ordering::Relaxed);
+                                debug!(
+                                    "[REQ_DONE] sent={} done={} inflight={}",
+                                    sent,
+                                    done,
+                                    sent - done
+                                );
+                            }
                             break;
                         }
                     }
