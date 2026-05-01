@@ -35,6 +35,7 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+from sglang.srt.layers.moe import is_tbo_enabled
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -441,11 +442,53 @@ class PrefillAdder:
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
 
+        # TBO-aware chunked prefill: split chunk budget into two equal halves so
+        # child_a and child_b of the TBO split each get ~chunk_size//2 tokens.
+        # _tbo_half_target: token threshold for first half (page-aligned).
+        # _tbo_committed:   extend tokens committed so far (page-aligned units).
+        if (
+            is_tbo_enabled()
+            and self.rem_chunk_tokens is not None
+            and self.rem_chunk_tokens > 0
+        ):
+            raw_half = self.rem_chunk_tokens // 2
+            # Page-align downward; keep at least one page.
+            self._tbo_half_target = max(
+                self.page_size,
+                (raw_half // self.page_size) * self.page_size,
+            )
+        else:
+            self._tbo_half_target = None
+        self._tbo_committed = 0
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+
+    def _get_tbo_effective_trunc_len(self) -> Optional[int]:
+        """Return effective chunked-prefill truncation length for TBO-aware scheduling.
+
+        When TBO (two-batch overlap) is enabled, we split the chunk token budget
+        into two equal halves so that TBO's balanced split lands on a sequence
+        boundary rather than falling back to the expensive two-chunk (mid-sequence)
+        split path.
+
+        Phase 1 (committed < half_target): cap at remaining first-half budget.
+        Phase 2 (committed >= half_target): use the full remaining chunk budget.
+
+        Returns None when chunked prefill is disabled (rem_chunk_tokens is None).
+        """
+        if self.rem_chunk_tokens is None:
+            return None
+        if self._tbo_half_target is None:
+            # TBO not enabled or chunk budget too small — normal behaviour.
+            return self.rem_chunk_tokens
+        if self._tbo_committed < self._tbo_half_target:
+            first_half_rem = self._tbo_half_target - self._tbo_committed
+            return min(first_half_rem, self.rem_chunk_tokens)
+        return self.rem_chunk_tokens
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -562,6 +605,10 @@ class PrefillAdder:
         elif self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
 
+        # TBO-aware: track extend tokens committed towards the first-half target.
+        if self._tbo_half_target is not None:
+            self._tbo_committed += extend_input_len
+
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
@@ -643,6 +690,11 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+
+        # TBO-aware: also cap at the first-half boundary when in phase 1.
+        tbo_eff = self._get_tbo_effective_trunc_len()
+        if tbo_eff is not None:
+            _rem_tokens = min(_rem_tokens, tbo_eff)
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
@@ -855,46 +907,56 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
-                self.can_run_list.append(req)
-
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(
-                    prefix_len,
-                    input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
-                )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                # Determine the effective truncation length.
+                # When TBO is enabled, _get_tbo_effective_trunc_len() may return
+                # a value smaller than rem_chunk_tokens to ensure the first half
+                # of the chunk budget (child_a) and the second half (child_b)
+                # each receive roughly equal token counts, avoiding the costly
+                # two-chunk (mid-sequence) TBO split path.
+                effective_trunc_len = self._get_tbo_effective_trunc_len()
 
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                if effective_trunc_len is None or input_tokens <= effective_trunc_len:
+                    # Non-chunked prefill (fits within effective budget).
+                    self.can_run_list.append(req)
 
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
+                    self._req_inc_lock_ref(req)
+                    self._update_prefill_budget(
+                        prefix_len,
+                        input_tokens,
+                        min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        ),
+                    )
+                else:
+                    # Chunked prefill: truncate to effective budget.
+                    # Make sure at least one page is available.
+                    trunc_len = effective_trunc_len // self.page_size * self.page_size
+
+                    if trunc_len <= 0:
                         return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
 
-                # Chunked prefill
-                req.set_extend_input_len(trunc_len)
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                    # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                    # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                    # we need the prefill prefix length to be multiple of attention split size
+                    if truncation_align_size is not None:
+                        if trunc_len < truncation_align_size:
+                            return AddReqResult.OTHER
+                        else:
+                            trunc_len = truncation_align_size * (
+                                trunc_len // truncation_align_size
+                            )
 
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
+                    # Chunked prefill
+                    req.set_extend_input_len(trunc_len)
+                    req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                    self.can_run_list.append(req)
+                    self.new_chunked_req = req
+
+                    self._req_inc_lock_ref(req)
+                    self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
 
