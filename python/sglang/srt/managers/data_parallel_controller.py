@@ -153,6 +153,14 @@ class DataParallelController:
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
 
+        # Wave dispatch
+        self.wave_enabled = server_args.enable_wave_dispatch
+        if self.wave_enabled:
+            from sglang.srt.managers.scheduler_wave import WavePlanner
+
+            self.wave_planner = WavePlanner(dp_size=server_args.dp_size)
+            logger.info("Wave dispatch enabled: dp_size=%d", server_args.dp_size)
+
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
 
@@ -580,6 +588,12 @@ class DataParallelController:
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
+        if self.wave_enabled:
+            self._event_loop_wave()
+        else:
+            self._event_loop_original()
+
+    def _event_loop_original(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
@@ -588,6 +602,34 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+    def _event_loop_wave(self):
+        while True:
+            self.soft_watchdog.feed()
+
+            while True:
+                try:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+
+                if isinstance(
+                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                ):
+                    self.wave_planner.add_req(recv_req)
+                else:
+                    self._request_dispatcher(recv_req)
+
+            if self.wave_planner.buffer_size > 0:
+                self._flush_wave()
+
+    def _flush_wave(self):
+        wave_infos, new_rr = self.wave_planner.flush_wave(self.round_robin_counter)
+        self.round_robin_counter = new_rr
+
+        for rank, wave_info in enumerate(wave_infos):
+            if self.status[rank]:
+                self.workers[rank].send_pyobj(wave_info)
 
 
 def run_data_parallel_controller_process(

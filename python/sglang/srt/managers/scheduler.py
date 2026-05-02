@@ -1482,25 +1482,7 @@ class Scheduler(
 
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-                recv_reqs = []
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                recv_reqs = self._recv_from_zmq()
             else:
                 recv_reqs = None
         else:
@@ -1602,6 +1584,45 @@ class Scheduler(
                 barrier(group=self.tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
+
+        return recv_reqs
+
+    def _recv_from_zmq(self) -> List:
+        """Drain messages from zmq sockets.
+
+        When wave dispatch is enabled, stop after receiving the first
+        WaveInfo and unpack its reqs inline. This ensures the scheduler
+        processes exactly one wave per scheduling round — remaining
+        waves stay in zmq for the next round.
+
+        When wave dispatch is disabled, drain everything as before.
+        """
+        from sglang.srt.managers.scheduler_wave import WaveInfo
+
+        recv_reqs = []
+        wave_enabled = self.server_args.enable_wave_dispatch
+
+        while True:
+            try:
+                if self.recv_limit_reached(len(recv_reqs)):
+                    break
+                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+
+            if wave_enabled and isinstance(recv_req, WaveInfo):
+                recv_reqs.extend(recv_req.reqs)
+                break
+            recv_reqs.append(recv_req)
+
+        while True:
+            try:
+                if self.recv_limit_reached(len(recv_reqs)):
+                    break
+                recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_rpc)
 
         return recv_reqs
 

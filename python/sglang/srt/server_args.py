@@ -640,6 +640,7 @@ class ServerArgs:
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
+    enable_wave_dispatch: bool = False
     enable_torch_compile: bool = False
     disable_piecewise_cuda_graph: bool = False
     enforce_piecewise_cuda_graph: bool = False
@@ -5705,6 +5706,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.tbo_token_distribution_threshold,
             help="The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
+        )
+        parser.add_argument(
+            "--enable-wave-dispatch",
+            action="store_true",
+            help="Enable wave-based dispatch in the DP coordinator. "
+            "When enabled, requests are batched into waves and each DP rank "
+            "scheduler strictly processes only the requests in its wave.",
         )
         parser.add_argument(
             "--enable-torch-compile",
