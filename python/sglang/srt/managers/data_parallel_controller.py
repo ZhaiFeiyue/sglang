@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import signal
 import threading
 import time
@@ -40,6 +41,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler_wave import WavePlanner
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -152,6 +154,25 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+
+        # Wave-based dispatch for TBO-aware scheduling
+        self.wave_enabled = (
+            server_args.enable_two_batch_overlap and server_args.enable_dp_attention
+        )
+        if self.wave_enabled:
+            self.wave_planner = WavePlanner(
+                dp_size=server_args.dp_size,
+                chunk_budget_per_rank=server_args.chunked_prefill_size or 0,
+                page_size=server_args.page_size or 1,
+                tbo_enabled=True,
+                tbo_threshold=server_args.tbo_token_distribution_threshold,
+            )
+            # Set env var so scheduler processes auto-patch for WaveInfo
+            os.environ["SGLANG_WAVE_DISPATCH"] = "1"
+            logger.info(
+                f"Wave dispatch enabled: dp_size={server_args.dp_size}, "
+                f"chunk_budget={server_args.chunked_prefill_size}"
+            )
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -579,7 +600,29 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
         self.workers[target_worker].send_pyobj(req)
 
+    def _flush_wave(self):
+        """Flush accumulated reqs as a wave to all ranks."""
+        assignments, wave_infos, new_rr = self.wave_planner.flush_wave(
+            self.round_robin_counter
+        )
+        self.round_robin_counter = new_rr
+
+        # Send reqs to their assigned ranks
+        for rank, req in assignments:
+            if self.status[rank]:
+                self.workers[rank].send_pyobj(req)
+
+        # Send WaveInfo marker to each rank
+        for rank, info in enumerate(wave_infos):
+            if self.status[rank]:
+                self.workers[rank].send_pyobj(info)
+
     def event_loop(self):
+        if not self.wave_enabled:
+            return self._event_loop_original()
+        self._event_loop_wave()
+
+    def _event_loop_original(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
@@ -588,6 +631,35 @@ class DataParallelController:
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+    def _event_loop_wave(self):
+        """Wave-based event loop: accumulate reqs, then flush as wave."""
+        from sglang.srt.managers.io_struct import (
+            TokenizedEmbeddingReqInput,
+            TokenizedGenerateReqInput,
+        )
+
+        while True:
+            self.soft_watchdog.feed()
+
+            # Drain all available reqs from tokenizer
+            while True:
+                try:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+
+                # Generate/embedding reqs go to wave planner; control messages bypass
+                if isinstance(
+                    recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                ):
+                    self.wave_planner.add_req(recv_req)
+                else:
+                    self._request_dispatcher(recv_req)
+
+            # Flush wave if ready
+            if self.wave_planner.should_flush():
+                self._flush_wave()
 
 
 def run_data_parallel_controller_process(

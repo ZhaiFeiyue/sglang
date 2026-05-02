@@ -139,6 +139,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    wave_info=None,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -207,6 +208,11 @@ def prepare_mlp_sync_batch_raw(
             )
         )
 
+    # Note: wave_info carries TBO metadata from the coordinator but we
+    # don't override tbo_split_seq_index here — the actual TBO split
+    # is computed later by TboForwardBatchPreparer from batch.extend_seq_lens.
+    # Wave's value is for coordinator-side packing decisions only.
+
     need_idle_batch = skip_all_gather or max(mlp_sync_info.global_num_tokens) > 0
     if need_idle_batch:
         batch_to_gather = local_batch
@@ -227,6 +233,14 @@ def prepare_mlp_sync_batch_raw(
 
 class SchedulerDPAttnMixin:
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
+        # Lazy apply wave patch on first call
+        if not getattr(SchedulerDPAttnMixin, "_wave_patch_applied", False):
+            SchedulerDPAttnMixin._wave_patch_applied = True
+            from sglang.srt.managers.wave_patch import maybe_patch
+
+            maybe_patch()
+
+        wave_info = getattr(self, "current_wave_info", None)
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
@@ -238,6 +252,7 @@ class SchedulerDPAttnMixin:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            wave_info=wave_info,
         )
 
     def maybe_prepare_mlp_sync_batch(
