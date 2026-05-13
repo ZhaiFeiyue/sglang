@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import ctypes
 import dataclasses
 import logging
@@ -263,6 +264,10 @@ class MoriKVManager(CommonKVManager):
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[MemoryDesc] = []
         self.transfer_lock = threading.Lock()
+        self._transfer_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mori-xfer"
+        )
+        self._outstanding_statuses = []
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         # Send CPU-resident AUX data via RDMA instead of ZMQ TCP.
@@ -640,6 +645,7 @@ class MoriKVManager(CommonKVManager):
             [plan.sizes],
             [transfer_uid],
         )
+        time.sleep(0.001)  # inter-layer throttle: allow RDMA CQ drain
         return statuses
 
     def _build_contiguous_transfer_plan(
@@ -1237,6 +1243,7 @@ class MoriKVSender(CommonKVSender):
         self.conclude_state: Optional[KVPoll] = None
         self.status_notified = False
         self.init_time = time.time()
+        self._send_futures = []
 
     def send(
         self,
@@ -1262,21 +1269,34 @@ class MoriKVSender(CommonKVSender):
                 return
 
         normalized_state = _normalize_state_indices(state_indices) if is_last else None
-        statuses, infos = self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            is_last,
-            aux_index=self.aux_index if is_last else None,
-            state_indices=normalized_state,
-        )
-        self.transfer_statuses.extend(statuses)
-        self._record_transfer_indices(kv_indices, None)
-        if infos is not None:
-            self.pending_infos = infos
-            if is_last:
-                self.sent_last_chunk = True
-        self._maybe_finalize_if_room_failed()
+        _room = self.bootstrap_room
+        _aux = self.aux_index if is_last else None
+        _ref = self
+
+        def _xfer():
+            _mgr = _ref.kv_mgr
+            _rem = [s for s in _mgr._outstanding_statuses if s.InProgress()]
+            for _ps in _rem:
+                while _ps.InProgress():
+                    time.sleep(0.0005)
+            _mgr._outstanding_statuses.clear()
+            sts, infos = _mgr.add_transfer_request(
+                _room,
+                kv_indices,
+                index_slice,
+                is_last,
+                aux_index=_aux,
+                state_indices=normalized_state,
+            )
+            _mgr._outstanding_statuses.extend(sts)
+            _ref.transfer_statuses.extend(sts)
+            _ref._record_transfer_indices(kv_indices, None)
+            if infos is not None:
+                _ref.pending_infos = infos
+                if is_last:
+                    _ref.sent_last_chunk = True
+
+        self._send_futures.append(self.kv_mgr._transfer_executor.submit(_xfer))
 
     def _maybe_finalize_if_room_failed(self) -> None:
         if self.conclude_state is not None:
@@ -1287,6 +1307,20 @@ class MoriKVSender(CommonKVSender):
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
+
+        # Check async transfer futures
+        if self._send_futures:
+            if any(not f.done() for f in self._send_futures):
+                return KVPoll.Transferring
+            for f in self._send_futures:
+                exc = f.exception()
+                if exc is not None:
+                    reason = f"KV transfer failed: {exc}"
+                    self.kv_mgr.record_failure(self.bootstrap_room, reason)
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    self._finalize_failure(reason)
+                    return KVPoll.Failed
+            self._send_futures.clear()
 
         if self.bootstrap_room not in self.kv_mgr.request_status:
             self._finalize_failure()
