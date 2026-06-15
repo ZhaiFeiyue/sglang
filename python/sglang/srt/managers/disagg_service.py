@@ -19,6 +19,12 @@ def start_disagg_service(
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
     if disagg_mode == DisaggregationMode.PREFILL:
+        # In PP stage disaggregation each stage is its own prefill process, but
+        # they must share ONE KV bootstrap server (hosted by the entry stage)
+        # so a single decode can discover every stage via one bootstrap addr.
+        # Non-entry stages skip binding it (they register to the entry stage).
+        if server_args.pp_stage_disaggregation and server_args.pp_stage_id != 0:
+            return None
         # only start bootstrap server on prefill tm
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER

@@ -1156,11 +1156,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                     )
 
+            # In PP stage-disaggregation mode, each stage runs in its own NCCL
+            # world that only contains the intra-stage TP/attn ranks. The torch
+            # PP dimension is collapsed to 1; cross-stage activations flow over
+            # the mori-backed virtual PP group installed below.
+            stage_disagg = self.server_args.pp_stage_disaggregation
+            torch_pp_size = 1 if stage_disagg else self.pp_size
+            torch_pp_rank = 0 if stage_disagg else self.pp_rank
+
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                world_size=self.tp_size * torch_pp_size,
+                rank=self.tp_size * torch_pp_rank + self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
@@ -1170,7 +1178,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 attention_data_parallel_size=self.dp_size,
-                pipeline_model_parallel_size=self.pp_size,
+                pipeline_model_parallel_size=torch_pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
@@ -1182,6 +1190,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
+            if stage_disagg:
+                self._install_mori_pp_group()
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
@@ -1230,6 +1240,128 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
         return pre_model_load_memory
+
+    def _install_mori_pp_group(self):
+        """Build the dedicated activation transport + virtual PP group and
+        install it so get_pp_group() returns num_stages stages over mori IO.
+
+        Neighbor / full-stage endpoints are wired later by the bootstrap layer
+        (see set_neighbor_endpoints / set_stage_endpoints); this only stands up
+        the engine + ring buffers and the identity surface.
+        """
+        from sglang.srt.disaggregation.mori.activation import MoriActivationTransport
+        from sglang.srt.distributed.mori_pp_group import MoriPPGroup
+        from sglang.srt.distributed.parallel_state import set_mori_pp_group
+        from sglang.srt.layers.dp_attention import (
+            get_attention_tp_rank,
+            get_attention_tp_size,
+        )
+
+        sa = self.server_args
+        stage_id = sa.pp_stage_id
+        num_stages = sa.pp_num_stages
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+        mc = self.model_config
+        hc_hidden = getattr(mc, "hc_hidden_size", None) or mc.hidden_size
+        per_token_bytes = (hc_hidden + mc.hidden_size) * mc.dtype.itemsize
+        max_tokens = max(
+            sa.chunked_prefill_size if sa.chunked_prefill_size > 0 else 0,
+            getattr(self, "max_prefill_tokens", 0),
+            8192,
+        )
+        slot_bytes = max_tokens * per_token_bytes
+
+        # Capacity model: the activation ring is the cross-stage analogue of the
+        # KV pool. ``num_slots`` is the number of microbatches that can be in
+        # flight on one (prev->next) edge. To keep the lockstep pipeline from
+        # self-deadlocking it must cover the full pipeline depth plus the async
+        # batch-depth lookahead, with a small margin.
+        min_slots = sa.pp_num_stages + sa.pp_async_batch_depth + 2
+        if sa.pp_activation_io_buffer_bytes > 0:
+            num_slots = max(2, sa.pp_activation_io_buffer_bytes // max(slot_bytes, 1))
+            if num_slots < min_slots:
+                logger.warning(
+                    "pp_activation_io_buffer_bytes=%d yields only %d ring slots "
+                    "(< pipeline depth %d); raising to %d to avoid stalls. "
+                    "Increase the buffer budget or reduce chunked_prefill_size.",
+                    sa.pp_activation_io_buffer_bytes,
+                    num_slots,
+                    min_slots,
+                    min_slots,
+                )
+                num_slots = min_slots
+        else:
+            num_slots = min_slots
+
+        use_xgmi = self._resolve_pp_activation_xgmi()
+
+        transport = MoriActivationTransport(
+            stage_id=stage_id,
+            num_stages=num_stages,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=attn_tp_size,
+            gpu_id=self.gpu_id,
+            device=self.device,
+            ib_device=sa.pp_activation_ib_device,
+            max_slot_bytes=int(slot_bytes),
+            num_slots=int(num_slots),
+            use_xgmi=use_xgmi,
+        )
+        group = MoriPPGroup(
+            stage_id=stage_id,
+            num_stages=num_stages,
+            transport=transport,
+            device=self.device,
+        )
+        self.mori_activation_transport = transport
+        self.mori_pp_group = group
+        set_mori_pp_group(group)
+        logger.info(
+            "Installed MoriPPGroup stage %d/%d (attn_tp=%d/%d, backend=%s, "
+            "slot_bytes=%d, slots=%d, ring_pool=%.2f GiB/edge)",
+            stage_id,
+            num_stages,
+            attn_tp_rank,
+            attn_tp_size,
+            "xgmi" if use_xgmi else "rdma",
+            int(slot_bytes),
+            int(num_slots),
+            (2 * int(slot_bytes) * int(num_slots)) / (1 << 30),
+        )
+
+    def _resolve_pp_activation_xgmi(self) -> bool:
+        """Resolve the activation backend choice into a use_xgmi flag.
+
+        ``xgmi``/``rdma`` are explicit. ``auto`` selects xgmi only when every
+        stage shares the coordinator host (single-node deployment), which is
+        the case where the GPU fabric is usable; otherwise rdma. mori itself
+        falls back to rdma if the XGMI backend is unavailable.
+        """
+        sa = self.server_args
+        backend = getattr(sa, "pp_activation_backend", "auto")
+        if backend == "xgmi":
+            return True
+        if backend == "rdma":
+            return False
+        # auto
+        host = sa.pp_activation_bootstrap_host
+        if not host:
+            return False
+        try:
+            from sglang.srt.utils.network import get_local_ip_auto
+
+            local_ip = get_local_ip_auto()
+        except Exception:
+            return False
+        same_node = host in (local_ip, "127.0.0.1", "localhost")
+        if same_node:
+            logger.info(
+                "pp_activation_backend=auto -> xgmi (coordinator host %s is local)",
+                host,
+            )
+        return same_node
 
     def init_shared_mooncake_transfer_engine(self):
         """

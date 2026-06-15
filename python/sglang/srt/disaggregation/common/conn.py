@@ -136,8 +136,16 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = server_args.pp_size
-        self.pp_rank = self.kv_args.pp_rank
+        # In PP stage disaggregation the torch-level pp_size is 1, but the KV
+        # transport must advertise the *stage* topology so a (possibly non-PP)
+        # decode can discover every prefill stage and pull each stage's layer
+        # slice. Stage identity comes from pp_num_stages / pp_stage_id.
+        if server_args.pp_stage_disaggregation:
+            self.pp_size = server_args.pp_num_stages
+            self.pp_rank = server_args.pp_stage_id
+        else:
+            self.pp_size = server_args.pp_size
+            self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
@@ -170,6 +178,12 @@ class CommonKVManager(BaseKVManager):
                 self.bootstrap_port
             )
             self.register_to_bootstrap()
+            # Re-register periodically so that if the (entry-stage-hosted)
+            # bootstrap server is restarted, every stage re-populates it without
+            # operator intervention. Registration is idempotent: the server only
+            # bumps its generation when our rank_port actually changes, so this
+            # never triggers spurious decode-side cache invalidation.
+            self._start_periodic_reregister()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
@@ -384,9 +398,40 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
+    def _start_periodic_reregister(self, interval_s: float = 10.0):
+        """Periodically re-PUT this prefill rank's info to the bootstrap server.
+
+        Makes KV-transport discovery resilient to a bootstrap-server (entry
+        stage) restart: every stage keeps re-advertising itself, so a freshly
+        restarted server is re-populated within ``interval_s``."""
+
+        def _loop():
+            while True:
+                time.sleep(interval_s)
+                try:
+                    self.register_to_bootstrap()
+                except Exception:
+                    logger.debug(
+                        "Periodic bootstrap re-registration failed", exc_info=True
+                    )
+
+        threading.Thread(
+            target=_loop, daemon=True, name="kv-bootstrap-reregister"
+        ).start()
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
-        if self.dist_init_addr:
+        if self.server_args.pp_stage_disaggregation:
+            # PP stage disaggregation: every stage is a separate process, but
+            # only the entry stage (stage 0) hosts the shared KV bootstrap
+            # server (see disagg_service.start_disagg_service). All stages
+            # register their per-stage KV engine there, keyed by pp_rank, so a
+            # single decode can discover every stage. The coordinator host is
+            # the same one used for the activation-ring rendezvous.
+            host = self.server_args.pp_activation_bootstrap_host
+            if host in ("0.0.0.0", "::"):
+                host = self.local_ip
+        elif self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
         else:
@@ -1160,6 +1205,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self._registered_count = 0
+        # Set of (dp, cp, tp, pp) keys seen so far, so a prefill *re-registration*
+        # (e.g. after a hot restart of a PP stage) does not double-count toward
+        # the readiness barrier.
+        self._registered_keys: Set[Tuple[int, int, int, int]] = set()
+        # Monotonic counter bumped on every prefill (re-)registration. A decode
+        # worker polls this to detect that some prefill stage has restarted (and
+        # therefore advertises a fresh rank_port / KV engine), so it can drop its
+        # cached bootstrap info and re-register against the new engine.
+        self.prefill_generation = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -1190,9 +1244,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
+        self.app.router.add_get("/prefill_generation", self._handle_prefill_generation)
 
     async def _handle_health_check(self, request):
         return web.Response(text="OK", status=200)
+
+    async def _handle_prefill_generation(self, request):
+        # Cheap endpoint polled by decode heartbeat to notice prefill-stage
+        # restarts (the counter bumps on every (re-)registration).
+        return web.json_response({"generation": self.prefill_generation}, status=200)
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1257,12 +1317,38 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
+            prev = tp_group_table.get(pp_rank)
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
             )
 
-            self._registered_count += 1
+            reg_key = (dp_group, attn_cp_rank, attn_tp_rank, pp_rank)
+            if reg_key not in self._registered_keys:
+                self._registered_keys.add(reg_key)
+                self._registered_count += 1
+
+            # Only treat this as a "restart" (bumping the generation that decode
+            # watches) when the advertised endpoint actually changed. This keeps
+            # idempotent periodic re-registration cheap and lets a freshly
+            # restarted bootstrap server be re-populated without spurious
+            # cache invalidations on the decode side.
+            if prev is None or prev.rank_port != rank_port or prev.rank_ip != rank_ip:
+                self.prefill_generation += 1
+                if prev is not None:
+                    logger.info(
+                        "Prefill stage re-registered: DP%s CP%s TP%s PP%s "
+                        "%s:%s -> %s:%s (generation=%s)",
+                        dp_group,
+                        attn_cp_rank,
+                        attn_tp_rank,
+                        pp_rank,
+                        prev.rank_ip,
+                        prev.rank_port,
+                        rank_ip,
+                        rank_port,
+                        self.prefill_generation,
+                    )
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(

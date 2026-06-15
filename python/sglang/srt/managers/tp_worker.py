@@ -310,10 +310,13 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
-        # Sync random seed across TP workers
+        # Sync random seed across TP workers. In PP stage disaggregation the
+        # torch world is intra-stage (TP only) with the PP dimension collapsed,
+        # so the world rank uses torch pp_rank 0 rather than the stage id.
+        world_pp_rank = 0 if server_args.pp_stage_disaggregation else self.pp_rank
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
+            self.tp_size * world_pp_rank + tp_rank,
             self.world_group.cpu_group,
             src=self.world_group.ranks[0],
         )[0]

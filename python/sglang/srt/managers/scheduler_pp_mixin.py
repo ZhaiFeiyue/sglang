@@ -14,6 +14,7 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.mori.activation import PeerReconnected
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -45,6 +46,19 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+class _PPGlobalFlush(Exception):
+    """Raised on a (non-adjacent) surviving stage when it learns, via the
+    ring flush-generation heartbeat, that some other stage restarted and the
+    whole pipeline must drop its KV/radix state to the empty baseline.
+
+    Carries the target flush generation so the handler adopts it *without*
+    re-originating a new flush (which would never converge)."""
+
+    def __init__(self, target_gen: int):
+        super().__init__(f"PP global flush requested (gen={target_gen})")
+        self.target_gen = target_gen
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -65,6 +79,19 @@ class PPBatchMetadata:
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
+        """Reconnect-resilient wrapper around the PP scheduler loop."""
+        if not self.server_args.pp_stage_disaggregation:
+            return self._event_loop_pp_impl()
+        while True:
+            try:
+                self._event_loop_pp_impl()
+            except PeerReconnected as e:
+                self._pp_handle_reconnect(e)
+            except _PPGlobalFlush as e:
+                self._pp_handle_global_flush(e)
+
+    @DynamicGradMode()
+    def _event_loop_pp_impl(self: Scheduler):
         """
         A scheduler loop for pipeline parallelism.
         Notes:
@@ -90,6 +117,7 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
         while True:
+            self._pp_sync_flush_gen()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -110,6 +138,12 @@ class SchedulerPPMixin:
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                if self.server_args.pp_stage_disaggregation:
+                    # Snapshot the content key now, at build-time, before
+                    # run_batch's result post-processing can mutate the reqs'
+                    # token offsets -- so producer (post-launch) and consumer
+                    # (pre-launch) always derive the identical proxy key.
+                    self._pp_batch_identity(self.cur_batch)
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -158,6 +192,7 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                                 msg_type="proxy",
+                                batch_key=self._pp_batch_identity(self.cur_batch),
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -168,6 +203,19 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
+        """Reconnect-resilient wrapper: on a neighbor PP stage restart the inner
+        loop raises ``PeerReconnected``; we recover the activation links and
+        re-enter, which re-initializes all per-loop pipeline state."""
+        while True:
+            try:
+                self._event_loop_pp_disagg_prefill_impl()
+            except PeerReconnected as e:
+                self._pp_handle_reconnect(e)
+            except _PPGlobalFlush as e:
+                self._pp_handle_global_flush(e)
+
+    @DynamicGradMode()
+    def _event_loop_pp_disagg_prefill_impl(self: Scheduler):
         """
         This is the prefill server event loop for pipeline parallelism.
 
@@ -218,6 +266,7 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            self._pp_sync_flush_gen()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -252,6 +301,12 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                if self.server_args.pp_stage_disaggregation:
+                    # Snapshot the content key now, at build-time, before
+                    # run_batch's result post-processing can mutate the reqs'
+                    # token offsets -- so producer (post-launch) and consumer
+                    # (pre-launch) always derive the identical proxy key.
+                    self._pp_batch_identity(self.cur_batch)
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -284,24 +339,31 @@ class SchedulerPPMixin:
                         next_first_rank_mb_id,
                         consensus_bootstrapped_rids,
                         bootstrapped_rids,
+                        tag="consensus_bootstrap",
                     )
                 )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        tmbs,
+                        next_first_rank_mb_id,
+                        release_rids,
+                        transferred_rids,
+                        tag="consensus_release",
                     )
                 )
 
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
+                        self._pp_recv_pyobj_from_prev_stage(tag="consensus_bootstrap")
                     )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage(
+                        tag="consensus_release"
+                    )
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -316,13 +378,13 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        recv_reqs, async_send=True, tag="reqs"
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
+                        bootstrapped_rids, async_send=True, tag="bootstrap"
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                        transferred_rids, async_send=True, tag="xfer"
                     )
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -332,6 +394,7 @@ class SchedulerPPMixin:
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            batch_key=self._pp_batch_identity(self.cur_batch),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -346,6 +409,17 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
+        """Reconnect-resilient wrapper for the decode PP loop."""
+        while True:
+            try:
+                self._event_loop_pp_disagg_decode_impl()
+            except PeerReconnected as e:
+                self._pp_handle_reconnect(e)
+            except _PPGlobalFlush as e:
+                self._pp_handle_global_flush(e)
+
+    @DynamicGradMode()
+    def _event_loop_pp_disagg_decode_impl(self: Scheduler):
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -363,6 +437,7 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            self._pp_sync_flush_gen()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -402,6 +477,12 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                if self.server_args.pp_stage_disaggregation:
+                    # Snapshot the content key now, at build-time, before
+                    # run_batch's result post-processing can mutate the reqs'
+                    # token offsets -- so producer (post-launch) and consumer
+                    # (pre-launch) always derive the identical proxy key.
+                    self._pp_batch_identity(self.cur_batch)
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
@@ -442,6 +523,7 @@ class SchedulerPPMixin:
                         next_first_rank_mb_id,
                         consensus_retract_rids,
                         retract_rids,
+                        tag="consensus_retract",
                     )
                 )
 
@@ -451,12 +533,17 @@ class SchedulerPPMixin:
                         next_first_rank_mb_id,
                         consensus_prealloc_rids,
                         prealloc_rids,
+                        tag="consensus_prealloc",
                     )
                 )
 
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        tmbs,
+                        next_first_rank_mb_id,
+                        release_rids,
+                        transferred_rids,
+                        tag="consensus_release",
                     )
                 )
 
@@ -464,21 +551,27 @@ class SchedulerPPMixin:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage(
+                        tag="consensus_retract"
+                    )
                     next_consensus_retract_rids = self.process_retract_queue(
                         next_consensus_retract_rids
                     )
                 self._pp_commit_comm_work(send_consensus_retract_work)
 
                 if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage(
+                        tag="consensus_prealloc"
+                    )
                     next_consensus_prealloc_rids = self.process_prealloc_queue(
                         next_consensus_prealloc_rids
                     )
                 self._pp_commit_comm_work(send_consensus_prealloc_work)
 
                 if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage(
+                        tag="consensus_release"
+                    )
                     next_release_rids = self.process_decode_transfer_queue(
                         next_release_rids
                     )
@@ -496,16 +589,16 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        recv_reqs, async_send=True, tag="reqs"
                     )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
+                        retract_rids, async_send=True, tag="retract"
                     )
                     send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
+                        prealloc_rids, async_send=True, tag="prealloc"
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
+                        transferred_rids, async_send=True, tag="xfer"
                     )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
@@ -515,6 +608,7 @@ class SchedulerPPMixin:
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                            batch_key=self._pp_batch_identity(self.cur_batch),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -535,6 +629,275 @@ class SchedulerPPMixin:
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
+
+    def _pp_handle_reconnect(self: Scheduler, exc: PeerReconnected):
+        """Recover after a neighbor PP stage restarted and re-handshook the
+        activation link(s). The inner loop has unwound; here we (1) wait for the
+        producer link to be healthy again, (2) drop partial pipeline state, and
+        (3) let the inner loop re-enter (which re-inits per-loop state). Requests
+        that were mid-flight on the affected micro-batches are abandoned and the
+        load balancer retries them on a fresh bootstrap room."""
+        logger.warning(
+            "PP stage %d: activation %s-link reconnected (epoch=%d); recovering "
+            "pipeline and resuming.",
+            self.ps.pp_rank,
+            exc.link,
+            exc.epoch,
+        )
+        transport = self.pp_group.transport
+        # Block until our downstream has re-registered (producer link healthy).
+        # Retry across timeouts so a slow neighbor restart does not abort us.
+        while True:
+            try:
+                transport.wait_links_healthy(timeout_s=120.0)
+                break
+            except TimeoutError:
+                logger.warning(
+                    "PP stage %d: still waiting for downstream re-register...",
+                    self.ps.pp_rank,
+                )
+        # Free the KV / req-token pool memory held by every in-flight micro-batch
+        # before we drop the pipeline state. The outer loop re-enters and calls
+        # ``init_pp_loop_state`` which replaces ``mbs``/``running_mbs`` with fresh
+        # empty batches; without this the prefilled-but-abandoned reqs leak their
+        # pool allocations, tripping the scheduler's "pool memory leak detected"
+        # integrity check on the next batch.
+        freed = self._pp_abandon_inflight_reqs()
+        # Drop any partially-prefilled chunk: its activations belong to a dead
+        # epoch and must not be resumed.
+        self.chunked_req = None
+        # Restore the cross-stage KV-state invariant. A restarted neighbor comes
+        # up with an *empty* radix tree / KV pool, while this survivor's caches
+        # are still warm. In PP a prefix may be skipped only if *every* stage
+        # holds its KV; a divergent (warm-vs-empty) prefix set means the producer
+        # would skip a prefix the restarted consumer lacks -> missing-KV / token
+        # mismatch crash. The only state all stages can agree on after a restart
+        # is "empty", so flush this survivor down to the same clean baseline.
+        self._pp_flush_kv_to_empty_baseline()
+        # Originate a global flush generation so that *non-adjacent* stages
+        # (which never saw this link's epoch bump) also drop to the empty
+        # baseline. The bump rides the ring heartbeat in ``_pp_sync_flush_gen``.
+        # Only meaningful for >2 stages; for 2 stages both stages are adjacent
+        # to any restart and already flush here.
+        self._pp_bump_flush_gen()
+        logger.info(
+            "PP stage %d: reconnect recovery done (send_epoch=%d recv_epoch=%d, "
+            "freed %d in-flight reqs, KV flushed to empty baseline, flush_gen=%d).",
+            self.ps.pp_rank,
+            getattr(transport, "send_epoch", 0),
+            getattr(transport, "recv_epoch", 0),
+            freed,
+            self._pp_flush_gen,
+        )
+
+    # -------------------------------------------------- ring-wide flush barrier
+
+    @property
+    def _pp_flush_gen(self: Scheduler) -> int:
+        return getattr(self, "_pp_flush_gen_val", 0)
+
+    @_pp_flush_gen.setter
+    def _pp_flush_gen(self: Scheduler, v: int) -> None:
+        self._pp_flush_gen_val = v
+
+    @property
+    def _pp_applied_flush_gen(self: Scheduler) -> int:
+        return getattr(self, "_pp_applied_flush_gen_val", 0)
+
+    @_pp_applied_flush_gen.setter
+    def _pp_applied_flush_gen(self: Scheduler, v: int) -> None:
+        self._pp_applied_flush_gen_val = v
+
+    def _pp_bump_flush_gen(self: Scheduler) -> None:
+        """Mark this stage as the origin of a fresh global flush. We've already
+        flushed locally, so record it as applied; the heartbeat propagates the
+        new generation forward and other stages adopt (but never re-bump) it."""
+        self._pp_flush_gen = max(self._pp_flush_gen, self._pp_applied_flush_gen) + 1
+        self._pp_applied_flush_gen = self._pp_flush_gen
+
+    def _pp_sync_flush_gen(self: Scheduler) -> None:
+        """One full-ring exchange of the flush generation, once per outer loop.
+
+        Gated to >2 stages: with <=2 stages every stage is adjacent to any
+        restart and flushes in ``_pp_handle_reconnect`` directly, so the ring
+        barrier is unnecessary overhead. When a higher generation is observed
+        than this stage has applied, raise ``_PPGlobalFlush`` to unwind into a
+        clean re-init + flush (without re-originating a generation).
+
+        Deadlock-free: every participating stage pushes its generation to the
+        next stage and then pulls the previous stage's, so all pushes are in
+        flight before any pull blocks. A pull that lands on a mid-restart
+        neighbor is interrupted by ``PeerReconnected`` like every other ring op."""
+        if not self.server_args.pp_stage_disaggregation:
+            return
+        if self.ps.pp_size <= 2:
+            return
+        gen = self._pp_flush_gen
+        peer_gen = 0
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            self.pp_group.send_pyobj_next(int(gen), tag="flushgen")
+            peer_gen = self.pp_group.recv_pyobj_prev(tag="flushgen")
+        # Mirror the ring pyobj broadcast semantics used elsewhere so every
+        # intra-stage rank agrees on the observed generation.
+        if self.ps.attn_tp_size > 1:
+            peer_gen = broadcast_pyobj(
+                peer_gen,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+        if self.ps.attn_cp_size > 1:
+            peer_gen = broadcast_pyobj(
+                peer_gen,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+        observed = max(int(gen), int(peer_gen or 0))
+        self._pp_flush_gen = observed
+        if observed > self._pp_applied_flush_gen:
+            raise _PPGlobalFlush(observed)
+
+    def _pp_handle_global_flush(self: Scheduler, exc: _PPGlobalFlush) -> None:
+        """React to a propagated flush generation: abandon in-flight reqs and
+        drop KV/radix to the empty baseline, then adopt the generation WITHOUT
+        bumping (so propagation converges). Links are healthy here -- this is
+        not a reconnect, just a coordinated cache reset."""
+        logger.warning(
+            "PP stage %d: global flush gen=%d observed; resetting KV to baseline.",
+            self.ps.pp_rank,
+            exc.target_gen,
+        )
+        freed = self._pp_abandon_inflight_reqs()
+        self.chunked_req = None
+        self._pp_flush_kv_to_empty_baseline()
+        self._pp_flush_gen = max(self._pp_flush_gen, exc.target_gen)
+        self._pp_applied_flush_gen = self._pp_flush_gen
+        logger.info(
+            "PP stage %d: global flush done (gen=%d, freed %d in-flight reqs).",
+            self.ps.pp_rank,
+            self._pp_applied_flush_gen,
+            freed,
+        )
+
+    def _pp_flush_kv_to_empty_baseline(self: Scheduler) -> None:
+        """Unconditionally reset the radix cache and memory pools to empty.
+
+        Unlike ``flush_cache`` (which no-ops unless the scheduler is fully idle),
+        this is called from reconnect recovery *after* every in-flight request
+        has already been abandoned and purged, so an unguarded reset is safe and
+        required: it brings this surviving stage's KV state into agreement with
+        the freshly-restarted neighbor (which starts empty), keeping prefix reuse
+        coherent across all PP stages."""
+        self.cur_batch = None
+        self.last_batch = None
+        try:
+            self.tree_cache.reset()
+            self.req_to_token_pool.clear()
+            self.token_to_kv_pool_allocator.clear()
+            if getattr(self, "draft_worker", None):
+                self.draft_worker.clear_cache_pool()
+        except Exception as fe:
+            logger.warning(
+                "PP stage %d: KV flush during reconnect hit an error "
+                "(continuing; state may be partially reset): %s",
+                self.ps.pp_rank,
+                fe,
+            )
+
+    def _pp_abandon_inflight_reqs(self: Scheduler) -> int:
+        """Fully abandon every request still parked in the pipeline at reconnect.
+
+        A neighbor restart resets both stages' micro-batch pipelines to a fresh
+        phase (seq 0 at the new epoch). Any request that was mid-prefill on this
+        (surviving) stage holds a *partial* activation/KV state that no longer
+        lines up with the restarted neighbour's freshly-rebuilt ``positions`` --
+        resuming it makes the producer ship a half-chunk of hidden states whose
+        token count mismatches the consumer's positions (the rotary
+        "query/key/positions must have the same number of tokens" crash).
+
+        So we (1) free their KV + req-token pool allocations and (2) remove them
+        from every queue that survives the loop re-entry (``waiting_queue`` and
+        the disagg prefill queues; ``running_batch``/``mbs``/``running_mbs`` are
+        rebuilt by ``init_pp_loop_state``). The load balancer retries them on a
+        fresh bootstrap room. Deduplicated by ``req_pool_idx``."""
+        from sglang.srt.mem_cache.common import release_kv_cache
+
+        sources: List[Optional[ScheduleBatch]] = []
+        if self.chunked_req is not None:
+            sources.append(ScheduleBatch(reqs=[self.chunked_req]))
+        sources.extend(getattr(self, "mbs", []) or [])
+        sources.extend(getattr(self, "running_mbs", []) or [])
+
+        seen_idx = set()
+        abandoned_rids = set()
+        freed = 0
+        for batch in sources:
+            if batch is None:
+                continue
+            for req in getattr(batch, "reqs", None) or []:
+                rid = getattr(req, "rid", None)
+                if rid is not None:
+                    abandoned_rids.add(rid)
+                idx = getattr(req, "req_pool_idx", None)
+                if idx is None or idx in seen_idx:
+                    continue
+                seen_idx.add(idx)
+                try:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                except Exception as ce:  # best-effort: keep freeing the rest
+                    logger.warning(
+                        "PP stage %d: release_kv_cache failed for rid=%s: %s",
+                        self.ps.pp_rank,
+                        rid,
+                        ce,
+                    )
+                # ChunkCache.cache_finished_req frees KV but leaves the req-token
+                # slot; reclaim it here since the req is being discarded.
+                if getattr(req, "req_pool_idx", None) is not None:
+                    self.req_to_token_pool.free(req)
+                freed += 1
+
+        if abandoned_rids:
+            self._pp_purge_reqs_from_queues(abandoned_rids)
+        return freed
+
+    def _pp_purge_reqs_from_queues(self: Scheduler, rids: set) -> None:
+        """Drop abandoned reqs from queues that persist across loop re-entry so
+        they are never re-scheduled with freed KV. Best-effort and defensive:
+        queue attributes differ across disaggregation modes."""
+        wq = getattr(self, "waiting_queue", None)
+        if isinstance(wq, list):
+            self.waiting_queue = [r for r in wq if getattr(r, "rid", None) not in rids]
+
+        inflight = getattr(self, "disagg_prefill_inflight_queue", None)
+        if isinstance(inflight, list):
+            self.disagg_prefill_inflight_queue = [
+                r for r in inflight if getattr(r, "rid", None) not in rids
+            ]
+
+        bootstrap_q = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        inner = getattr(bootstrap_q, "queue", None)
+        if isinstance(inner, list):
+            bootstrap_q.queue = [
+                r for r in inner if getattr(r, "rid", None) not in rids
+            ]
+
+        # Notify the tokenizer so clients/LB see a clean abort and retry, rather
+        # than hanging until timeout. Guarded: a notify failure must not abort
+        # the reconnect recovery itself.
+        try:
+            from sglang.srt.managers.io_struct import AbortReq
+
+            send = self.ipc_channels.send_to_tokenizer
+            for rid in rids:
+                send.send_output(AbortReq(rid=rid), None)
+        except Exception as ne:
+            logger.warning(
+                "PP stage %d: failed to notify tokenizer of abandoned reqs: %s",
+                self.ps.pp_rank,
+                ne,
+            )
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
@@ -785,7 +1148,7 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
-    def _pp_pd_get_bootstrapped_ids(self: Scheduler):
+    def _pp_pd_get_bootstrapped_ids(self: Scheduler, tag: str = "bootstrap"):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
@@ -797,7 +1160,7 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage(tag=tag)
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
@@ -815,7 +1178,7 @@ class SchedulerPPMixin:
             )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
+    def _pp_pd_get_prefill_transferred_ids(self: Scheduler, tag: str = "xfer"):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
@@ -827,7 +1190,7 @@ class SchedulerPPMixin:
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage(tag=tag)
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
@@ -846,6 +1209,7 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         consensus_bootstrapped_rids: List[str],
         bootstrapped_rids: List[str],
+        tag: str = "consensus_bootstrap",
     ):
         # 3 (Release): send the release rids from last stage to the first stage
         send_consensus_bootstrapped_work = []
@@ -853,13 +1217,13 @@ class SchedulerPPMixin:
             if bmbs[next_first_rank_mb_id] is not None:
                 consensus_bootstrapped_rids = bootstrapped_rids
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
+                    consensus_bootstrapped_rids, async_send=True, tag=tag
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if consensus_bootstrapped_rids is not None:
                 send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
+                    consensus_bootstrapped_rids, async_send=True, tag=tag
                 )
         return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
 
@@ -869,19 +1233,20 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         release_rids: List[str],
         transferred_rids: List[str],
+        tag: str = "consensus_release",
     ):
         send_release_work = []
         if self.pp_group.is_last_rank:
             if tmbs[next_first_rank_mb_id] is not None:
                 release_rids = transferred_rids
                 send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
+                    release_rids, async_send=True, tag=tag
                 )
         # 4 (Release): send the release rids from non last rank to the next rank
         else:
             if release_rids is not None:
                 send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
+                    release_rids, async_send=True, tag=tag
                 )
         return send_release_work, release_rids
 
@@ -915,8 +1280,18 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler, data, async_send: bool = False, tag: str = "reqs"
+    ):
         p2p_work = []
+        if self.server_args.pp_stage_disaggregation:
+            # No cross-stage world_group; relay over the mori ring pyobj channel.
+            # Only the attn entry rank ships; peers re-derive via intra-stage
+            # broadcast on the recv side. ``tag`` separates the concurrent PD
+            # consensus streams so their per-stream sequence numbers align.
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                self.pp_group.send_pyobj_next(data, tag=tag)
+            return p2p_work
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
             p2p_work = point_to_point_pyobj(
@@ -929,7 +1304,27 @@ class SchedulerPPMixin:
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler, tag: str = "reqs"):
+        if self.server_args.pp_stage_disaggregation:
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                data = self.pp_group.recv_pyobj_prev(tag=tag)
+            else:
+                data = None
+            if self.ps.attn_tp_size > 1:
+                data = broadcast_pyobj(
+                    data,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                )
+            if self.ps.attn_cp_size > 1:
+                data = broadcast_pyobj(
+                    data,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+            return data
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
             data = point_to_point_pyobj(
@@ -975,11 +1370,55 @@ class SchedulerPPMixin:
             }
         return tensor_dict
 
+    @staticmethod
+    def _pp_batch_identity(batch: Optional[ScheduleBatch]) -> Optional[str]:
+        """Content key for a micro-batch's activation transfer.
+
+        Identifies the batch by its *ordered* requests and the exact number of
+        tokens each contributes to this forward (fill offset + extend length),
+        so a chunk of req X always pairs with the same chunk's positions on the
+        consumer. Used to key the proxy stream by identity rather than arrival
+        order -- a producer/consumer pair that built the same batch derives the
+        same key regardless of pipeline phase, eliminating the post-restart
+        rotary token-mismatch. Returns None when there is nothing to key on
+        (callers then fall back to positional sequencing).
+
+        The result is snapshotted onto the batch (``_pp_batch_key``) the first
+        time it is computed. ``run_batch``'s result post-processing mutates
+        ``prefix_indices`` / ``extend_input_len``; by caching at build-time we
+        make the key independent of *when* in the loop the producer (post-
+        launch) vs consumer (pre-launch) reads it, so both sides always agree."""
+        if batch is None or not getattr(batch, "reqs", None):
+            return None
+        cached = getattr(batch, "_pp_batch_key", None)
+        if cached is not None:
+            return cached
+        parts = []
+        for r in batch.reqs:
+            rid = getattr(r, "rid", None)
+            if rid is None:
+                return None  # cannot content-address; fall back to seq
+            # prefix_indices is a torch.Tensor; use len() (never truthiness,
+            # which raises "Boolean value of Tensor ... is ambiguous").
+            pi = getattr(r, "prefix_indices", None)
+            off = len(pi) if pi is not None else 0
+            ext = getattr(r, "extend_input_len", None)
+            if ext is None:
+                ext = 0
+            parts.append(f"{rid}#{off}#{ext}")
+        key = "|".join(parts)
+        try:
+            batch._pp_batch_key = key
+        except Exception:
+            pass  # exotic batch type without settable attrs: recompute is fine
+        return key
+
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        batch_key: Optional[str] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -989,6 +1428,9 @@ class SchedulerPPMixin:
             )
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
+        kwargs = {}
+        if batch_key is not None and self.server_args.pp_stage_disaggregation:
+            kwargs["batch_key"] = batch_key
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
@@ -996,6 +1438,7 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
                 async_send=async_send,
+                **kwargs,
             )
         )
         return p2p_work
@@ -1004,12 +1447,23 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        batch_key: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
         """
+        # Stage disaggregation: the virtual mori PP group is keyed by
+        # (msg_type, seq) -- or by ``batch_key`` (micro-batch identity) when
+        # supplied -- so no order-based demux/stashing is needed.
+        if self.server_args.pp_stage_disaggregation:
+            return self.pp_group.recv_tensor_dict_typed(
+                msg_type=expected_kind,
+                all_gather_group=all_gather_group,
+                batch_key=batch_key,
+            )
+
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
@@ -1036,12 +1490,21 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            # Content-address the proxy by the batch we just built so it pairs
+            # with the producer's matching batch irrespective of pipeline phase
+            # (only meaningful in stage-disaggregation mode).
+            batch_key = (
+                self._pp_batch_identity(self.cur_batch)
+                if self.server_args.pp_stage_disaggregation
+                else None
+            )
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
                     ),
+                    batch_key=batch_key,
                 )
             )
         return pp_proxy_tensors
@@ -1283,7 +1746,7 @@ class SchedulerPPMixin:
             )
         return tuple(rids) if len(rids) > 1 else rids[0]
 
-    def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
+    def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int, tag: str = "retract"):
         # communicate pre-consensus retracted reqs
         for req in self.disagg_decode_prealloc_queue.retracted_queue:
             # assign retracted reqs to the current microbatch
@@ -1299,10 +1762,10 @@ class SchedulerPPMixin:
             return curr_retract_rids
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
-            prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_retract_rids = self._pp_recv_pyobj_from_prev_stage(tag=tag)
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
-    def _pp_pd_get_prealloc_ids(self: Scheduler):
+    def _pp_pd_get_prealloc_ids(self: Scheduler, tag: str = "prealloc"):
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the preallocated reqs from the prealloc queue
@@ -1314,7 +1777,7 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
-            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage(tag=tag)
             prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
                 self.disagg_decode_prealloc_queue.queue,
@@ -1330,7 +1793,7 @@ class SchedulerPPMixin:
             )
         return [good_prealloc_rids, bad_prealloc_rids]
 
-    def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+    def _pp_pd_get_decode_transferred_ids(self: Scheduler, tag: str = "xfer"):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
@@ -1342,7 +1805,7 @@ class SchedulerPPMixin:
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage(tag=tag)
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,

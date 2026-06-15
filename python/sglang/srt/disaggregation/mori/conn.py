@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import msgspec
 import numpy as np
 import numpy.typing as npt
+import requests
 import zmq
 from mori.cpp import TransferStatus
 from mori.io import (
@@ -321,7 +322,14 @@ class MoriKVManager(CommonKVManager):
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
+            # Last prefill "generation" observed per bootstrap addr. A bump means
+            # some prefill PP stage hot-restarted (fresh rank_port / KV engine),
+            # so the cached bootstrap info must be dropped and re-registered.
+            self._prefill_generation_seen: Dict[str, int] = {}
             self._start_decode_thread()
+            # Heartbeat also drives prefill-restart detection via
+            # _on_heartbeat_success(); mori previously skipped it.
+            self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
@@ -627,6 +635,73 @@ class MoriKVManager(CommonKVManager):
                     info.dst_port,
                     bootstrap_room,
                 )
+
+    def _on_heartbeat_success(self, bootstrap_addr: str) -> None:
+        """Decode-side hook (runs every heartbeat interval).
+
+        Polls the bootstrap server's prefill generation counter; a bump means
+        a prefill PP stage hot-restarted and now advertises a fresh rank_port /
+        KV engine. When that happens we drop the cached bootstrap info for this
+        addr and fail any in-flight rooms so the next attempt re-discovers and
+        re-registers against the new engine -- this is what makes restarting an
+        arbitrary PP stage recoverable end-to-end."""
+        try:
+            resp = requests.get(
+                f"http://{bootstrap_addr}/prefill_generation", timeout=(2, 3)
+            )
+            if resp.status_code != 200:
+                return
+            generation = int(resp.json().get("generation", 0))
+        except Exception:
+            return
+
+        prev = self._prefill_generation_seen.get(bootstrap_addr)
+        self._prefill_generation_seen[bootstrap_addr] = generation
+        if prev is not None and generation != prev:
+            logger.info(
+                "Prefill generation for %s changed %s -> %s; a stage restarted, "
+                "invalidating cached bootstrap info and re-registering.",
+                bootstrap_addr,
+                prev,
+                generation,
+            )
+            self._invalidate_prefill_addr(bootstrap_addr)
+
+    def _invalidate_prefill_addr(self, bootstrap_addr: str) -> None:
+        """Drop cached connection info for ``bootstrap_addr`` and fail its
+        in-flight rooms so they retry against the restarted stage's new engine.
+
+        Unlike ``_handle_node_failure`` we keep ``prefill_info_table`` intact:
+        the bootstrap server (entry stage) is still alive, so topology
+        re-discovery via /route continues to work and ``_setup_bootstrap_infos``
+        will both refetch the new rank_port and re-run ``_register_kv_args``."""
+        with self.connection_lock:
+            stale_keys = [
+                k for k in self.connection_pool if k.startswith(bootstrap_addr)
+            ]
+            for k in stale_keys:
+                del self.connection_pool[k]
+            affected_rooms = list(self.addr_to_rooms_tracker.get(bootstrap_addr, ()))
+
+        for room in affected_rooms:
+            if (
+                room in self.request_status
+                and self.check_status(room) != KVPoll.Success
+            ):
+                self.record_failure(
+                    room,
+                    f"Prefill stage at {bootstrap_addr} restarted; request "
+                    f"{room} aborted for retry.",
+                )
+                self.update_status(room, KVPoll.Failed)
+            self._cleanup_room_tracking(room)
+        logger.info(
+            "Invalidated %d cached connection(s) and failed %d in-flight room(s) "
+            "for restarted prefill at %s",
+            len(stale_keys),
+            len(affected_rooms),
+            bootstrap_addr,
+        )
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key

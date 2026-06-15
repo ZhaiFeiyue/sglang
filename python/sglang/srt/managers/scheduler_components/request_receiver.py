@@ -118,14 +118,22 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
+                if self.server_args.pp_stage_disaggregation:
+                    # No cross-stage world_group; requests are relayed from the
+                    # ring-predecessor over the mori pyobj channel (the previous
+                    # stage's event loop calls _pp_send_pyobj_to_next_stage).
+                    from sglang.srt.distributed.parallel_state import get_pp_group
+
+                    recv_reqs = get_pp_group().recv_pyobj_prev(tag="reqs")
+                else:
+                    dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+                    recv_reqs = point_to_point_pyobj(
+                        [],
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
+                        self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    )
             else:
                 recv_reqs = None
         return recv_reqs

@@ -871,6 +871,36 @@ class ServerArgs:
     disaggregation_decode_polling_interval: int = 1
     optimistic_prefill_retries: int = 0
 
+    # PP stage disaggregation: treat each pipeline stage as an independent
+    # microservice with its own NCCL world (intra-stage TP only), connecting
+    # stages via mori IO activation transport instead of a single NCCL PP group.
+    # See mori-scheduler/docs/pp-stage-disaggregation-impl.md.
+    pp_stage_disaggregation: bool = False
+    # Which stage this process serves (0-indexed). Replaces pp_rank as the
+    # source of stage identity. Required when pp_stage_disaggregation is set.
+    pp_stage_id: Optional[int] = None
+    # Total number of pipeline stages (carries the old pp_size semantics for
+    # layer partitioning / KV pool sizing / first-last-rank gating).
+    pp_num_stages: int = 1
+    # RDMA/IB device used by the activation transport's dedicated IOEngine.
+    # Falls back to disaggregation_ib_device when unset.
+    pp_activation_ib_device: Optional[str] = None
+    # Transport backend for inter-stage activations:
+    #   "rdma" : one-sided RDMA batch_write (inter-node default).
+    #   "xgmi" : intra-node GPU<->GPU fabric (lower latency when co-located).
+    #   "auto" : pick xgmi when every stage shares the coordinator host,
+    #            otherwise rdma. mori falls back to rdma if XGMI is unavailable.
+    pp_activation_backend: str = "auto"
+    # Bootstrap port for the activation transport rendezvous (distinct from the
+    # KV disaggregation bootstrap port). Hosted by stage 0, attn_tp_rank 0.
+    pp_activation_bootstrap_port: int = 9100
+    # Host of the activation rendezvous coordinator (stage 0). All stages must
+    # be given the same value so they can exchange transport endpoints.
+    pp_activation_bootstrap_host: Optional[str] = None
+    # Byte budget for the per-stage activation ring buffer pool. 0 means derive
+    # automatically from max tokens per microbatch and proxy tensor width.
+    pp_activation_io_buffer_bytes: int = 0
+
     # Encode prefill disaggregation
     encoder_only: bool = False
     language_only: bool = False
@@ -3899,6 +3929,44 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
+            )
+        self._handle_pp_stage_disaggregation()
+
+    def _handle_pp_stage_disaggregation(self):
+        if not self.pp_stage_disaggregation:
+            return
+        # Each stage is its own process with an intra-stage-only NCCL world, so
+        # the torch-level pp_size must be 1; stage identity is carried by
+        # pp_stage_id / pp_num_stages instead.
+        if self.pp_size > 1:
+            raise ValueError(
+                "--pp-stage-disaggregation requires --pp-size 1 (the torch NCCL "
+                "world is intra-stage only); use --pp-num-stages to set the "
+                "number of stages and --pp-stage-id for this process's stage."
+            )
+        if self.pp_num_stages <= 1:
+            raise ValueError("--pp-stage-disaggregation requires --pp-num-stages > 1.")
+        if self.pp_stage_id is None or not (0 <= self.pp_stage_id < self.pp_num_stages):
+            raise ValueError(
+                f"--pp-stage-id must be in [0, {self.pp_num_stages}); "
+                f"got {self.pp_stage_id!r}."
+            )
+        # Stage disaggregation reuses the PP event loop (event_loop_pp), which is
+        # incompatible with overlap scheduling. The torch-level pp_size is 1, so
+        # _handle_pipeline_parallelism does not disable it for us here.
+        if not self.disable_overlap_schedule:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "PP stage disaggregation is incompatible with overlap schedule; "
+                "disabling overlap schedule."
+            )
+        # The activation transport reuses the mori IO engine machinery.
+        if self.pp_activation_ib_device is None:
+            self.pp_activation_ib_device = self.disaggregation_ib_device
+        if self.pp_activation_backend not in ("auto", "rdma", "xgmi"):
+            raise ValueError(
+                "--pp-activation-backend must be one of auto/rdma/xgmi; got "
+                f"{self.pp_activation_backend!r}."
             )
 
     def _validate_prefill_only_disable_kv_cache_args(self):
@@ -7430,6 +7498,67 @@ class ServerArgs:
             type=int,
             default=ServerArgs.optimistic_prefill_retries,
             help="Number of optimistic prefill retries that will skip the bootstrap wait. ",
+        )
+
+        # PP stage disaggregation
+        parser.add_argument(
+            "--pp-stage-disaggregation",
+            action="store_true",
+            help="Treat each pipeline stage as an independent microservice with its "
+            "own NCCL world (intra-stage TP only), connecting stages via mori IO "
+            "activation transport instead of a single NCCL PP group. Requires "
+            "--pp-stage-id and --pp-num-stages. See "
+            "mori-scheduler/docs/pp-stage-disaggregation-impl.md.",
+        )
+        parser.add_argument(
+            "--pp-stage-id",
+            type=int,
+            default=ServerArgs.pp_stage_id,
+            help="Which pipeline stage this process serves (0-indexed). Replaces "
+            "pp_rank as the source of stage identity under --pp-stage-disaggregation.",
+        )
+        parser.add_argument(
+            "--pp-num-stages",
+            type=int,
+            default=ServerArgs.pp_num_stages,
+            help="Total number of pipeline stages under --pp-stage-disaggregation "
+            "(carries the old pp_size semantics for layer partitioning).",
+        )
+        parser.add_argument(
+            "--pp-activation-ib-device",
+            type=str,
+            default=ServerArgs.pp_activation_ib_device,
+            help="RDMA/IB device used by the activation transport IOEngine. Falls "
+            "back to --disaggregation-ib-device when unset.",
+        )
+        parser.add_argument(
+            "--pp-activation-backend",
+            type=str,
+            choices=["auto", "rdma", "xgmi"],
+            default=ServerArgs.pp_activation_backend,
+            help="Transport backend for inter-stage activations. 'auto' picks "
+            "xgmi when all stages share the coordinator host, else rdma.",
+        )
+        parser.add_argument(
+            "--pp-activation-bootstrap-port",
+            type=int,
+            default=ServerArgs.pp_activation_bootstrap_port,
+            help="Bootstrap port for the activation transport rendezvous "
+            "(hosted by stage 0, attn_tp_rank 0).",
+        )
+        parser.add_argument(
+            "--pp-activation-bootstrap-host",
+            type=str,
+            default=ServerArgs.pp_activation_bootstrap_host,
+            help="Host of the activation rendezvous coordinator (stage 0). All "
+            "stages must share the same value to exchange transport endpoints.",
+        )
+        parser.add_argument(
+            "--pp-activation-io-buffer-bytes",
+            type=int,
+            default=ServerArgs.pp_activation_io_buffer_bytes,
+            help="Byte budget for the per-stage activation ring buffer pool. 0 means "
+            "derive automatically from max tokens per microbatch and proxy width.",
         )
 
         # Encode prefill disaggregation

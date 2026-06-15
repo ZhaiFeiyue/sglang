@@ -1618,8 +1618,21 @@ get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
 
+# In PP stage-disaggregation mode this holds a virtual, mori-backed PP group
+# (sglang.srt.distributed.mori_pp_group.MoriPPGroup). When set, get_pp_group()
+# returns it instead of the (PP=1) NCCL group, so model / KV / scheduler code
+# transparently sees num_stages stages connected over mori IO.
+_MORI_PP_GROUP = None
 
-def get_pp_group() -> GroupCoordinator:
+
+def set_mori_pp_group(group) -> None:
+    global _MORI_PP_GROUP
+    _MORI_PP_GROUP = group
+
+
+def get_pp_group():
+    if _MORI_PP_GROUP is not None:
+        return _MORI_PP_GROUP
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 

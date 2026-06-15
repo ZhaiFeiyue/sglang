@@ -361,11 +361,21 @@ class Scheduler(
                 server_args.attn_cp_size,
             )
         )
+        # In PP stage-disaggregation, the torch-level pp_size is 1 (intra-stage
+        # NCCL world only); stage identity comes from pp_stage_id/pp_num_stages
+        # so the scheduler PP logic, layer partitioning and KV sizing all see
+        # the correct stage. The torch world is collapsed separately in
+        # ModelRunner.init_torch_distributed.
+        if server_args.pp_stage_disaggregation:
+            pp_rank = server_args.pp_stage_id
+            ps_pp_size = server_args.pp_num_stages
+        else:
+            ps_pp_size = server_args.pp_size
         self.ps = ParallelState(
             tp_rank=tp_rank,
             tp_size=server_args.tp_size,
             pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
+            pp_size=ps_pp_size,
             dp_rank=dp_rank,
             dp_size=server_args.dp_size,
             attn_tp_rank=attn_tp_rank,
@@ -860,6 +870,9 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+
+        if self.server_args.pp_stage_disaggregation:
+            self._wire_mori_pp_stage()
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1391,6 +1404,102 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
+
+    def _wire_mori_pp_stage(self):
+        """Exchange activation transport endpoints across stages and wire the
+        virtual PP group's neighbor/full-stage tables. Stage 0 / attn_tp_rank 0
+        hosts the rendezvous registry."""
+        from sglang.srt.disaggregation.mori.stage_rendezvous import (
+            register_and_collect,
+            start_registry,
+        )
+
+        sa = self.server_args
+        group = self.pp_group  # MoriPPGroup
+        transport = group.transport
+        stage_id = self.ps.pp_rank
+        num_stages = self.ps.pp_size
+        tp_rank = self.ps.attn_tp_rank
+        tp_size = self.ps.attn_tp_size
+        expected = num_stages * tp_size
+
+        host = sa.pp_activation_bootstrap_host or transport.local_ip
+        port = sa.pp_activation_bootstrap_port
+
+        # The coordinator registry must outlive any single stage so that a
+        # restarted stage (including stage 0, when an external supervisor hosts
+        # it) can re-rendezvous. If we are stage 0 and no external registry
+        # answers, host it ourselves (best-effort; already-bound means an
+        # external/previous one is live).
+        if stage_id == 0 and tp_rank == 0:
+            try:
+                self._mori_stage_registry = start_registry(host, port, expected)
+            except OSError:
+                logger.info(
+                    "Stage rendezvous registry already bound at %s:%d "
+                    "(external supervisor or prior instance); reusing it.",
+                    host,
+                    port,
+                )
+
+        table, reregister = register_and_collect(
+            coordinator_host=host,
+            coordinator_port=port,
+            stage_id=stage_id,
+            attn_tp_rank=tp_rank,
+            endpoint=transport.endpoint,
+            expected=expected,
+        )
+
+        # Uniform ring: every stage's predecessor/successor wraps modulo
+        # num_stages, matching NCCL send->next_rank / recv<-prev_rank. The
+        # last stage's successor is stage 0 (output return path).
+        ring_prev = (stage_id - 1) % num_stages
+        ring_next = (stage_id + 1) % num_stages
+        upstream = table[(ring_prev, tp_rank)]
+        downstream = table[(ring_next, tp_rank)]
+        group.set_neighbor_endpoints(upstream, downstream)
+        group.set_stage_endpoints(
+            {sid: table[(sid, tp_rank)] for sid in range(num_stages)}
+        )
+
+        if reregister:
+            # This process is a *restart* of an already-registered stage. Both
+            # of our ring links must be re-handshook at a fresh, globally
+            # monotonic epoch (wall-clock ms always exceeds any prior epoch):
+            #   * upstream link: re-register our recv buffers to the (live)
+            #     producer, which resets its credits for us.
+            #   * downstream link: actively tell our (live) consumer to
+            #     re-register to our new engine (it cannot detect us otherwise).
+            epoch = int(time.time() * 1000)
+            logger.warning(
+                "Re-wiring Mori PP stage %d/%d after restart at epoch %d "
+                "(upstream=%s downstream=%s)",
+                stage_id,
+                num_stages,
+                epoch,
+                upstream,
+                downstream,
+            )
+            transport.register_with_upstream(upstream, epoch=epoch)
+            transport.announce_restart_to_downstream(downstream, epoch)
+            transport.wait_downstream_registered()
+            return
+
+        # As a consumer, advertise our recv buffers to the ring-predecessor
+        # producer (which writes proxy/output into them).
+        transport.register_with_upstream(upstream)
+        # Block until our ring-successor has registered with us, so the first
+        # activation push does not race the registration handshake.
+        transport.wait_downstream_registered()
+        logger.info(
+            "Wired Mori PP stage %d/%d (tp_rank=%d): upstream=%s downstream=%s",
+            stage_id,
+            num_stages,
+            tp_rank,
+            upstream,
+            downstream,
+        )
 
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
@@ -3340,6 +3449,9 @@ class Scheduler(
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
 
+        # activation-transport stats (stage disaggregation only)
+        self._maybe_log_mori_pp_stats()
+
         # kv event publishing
         self.kv_events_publisher.publish_kv_events()
 
@@ -3354,6 +3466,26 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+
+    def _maybe_log_mori_pp_stats(self):
+        """Log the mori activation-transport counters at most every 30s when
+        running under PP stage disaggregation. Surfaces back-pressure
+        (credit_stalls / credit_wait_s) and ring-buffer occupancy for capacity
+        tuning."""
+        if not self.server_args.pp_stage_disaggregation:
+            return
+        stats_fn = getattr(self.pp_group, "transport_stats", None)
+        if stats_fn is None:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_last_mori_pp_stats_log", 0.0)
+        if now - last < 30.0:
+            return
+        self._last_mori_pp_stats_log = now
+        try:
+            logger.info("[pp-stage-disagg] activation transport %s", stats_fn())
+        except Exception:
+            logger.debug("failed to read mori pp transport stats", exc_info=True)
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
@@ -3947,7 +4079,9 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
-        elif server_args.pp_size > 1:
+        elif server_args.pp_size > 1 or server_args.pp_stage_disaggregation:
+            # Stage disaggregation reuses the lockstep PP loop; the virtual
+            # mori PP group routes activations/relays over mori IO.
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
@@ -3956,14 +4090,16 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if server_args.pp_size > 1:
+        if server_args.pp_size > 1 or server_args.pp_stage_disaggregation:
+            # Stage disaggregation reuses the lockstep PP prefill loop; cross-stage
+            # consensus/req relays travel over the mori ring (tagged pyobj streams).
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
-        if server_args.pp_size > 1:
+        if server_args.pp_size > 1 or server_args.pp_stage_disaggregation:
             scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()

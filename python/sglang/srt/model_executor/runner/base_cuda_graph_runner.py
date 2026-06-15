@@ -128,7 +128,14 @@ class BaseCudaGraphRunner(ABC):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        # In PP stage disaggregation the torch-level pp_size is collapsed to 1,
+        # but the model forward gates proxy-tensor I/O on the virtual PP group
+        # (MoriPPGroup) whose world_size == pp_num_stages. The graph runner must
+        # match that so non-first stages allocate dummy proxy inputs for capture.
+        if model_runner.server_args.pp_stage_disaggregation:
+            self.pp_size = model_runner.server_args.pp_num_stages
+        else:
+            self.pp_size = model_runner.server_args.pp_size
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
