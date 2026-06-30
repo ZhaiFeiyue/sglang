@@ -1386,6 +1386,11 @@ class MoriKVSender(CommonKVSender):
         self._notify_lock = threading.Lock()
         self._notified_status: Optional[KVPoll] = None
         self._notified_reason: Optional[str] = None
+        # Wall-clock start of the actual KV transfer (first non-empty chunk),
+        # used to report the real prefill->decode transfer latency. Mirrors the
+        # NIXL backend so sglang:kv_transfer_latency_ms is comparable across
+        # backends instead of only covering the last-chunk window.
+        self._transfer_start_time: Optional[float] = None
 
     def send(
         self,
@@ -1397,6 +1402,11 @@ class MoriKVSender(CommonKVSender):
         )
         if should_skip:
             return
+
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
 
         normalized_state = (
             _normalize_state_indices_per_component(state_indices)
@@ -1452,6 +1462,7 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure(self._collect_failure_reason())
             return
         if task.is_last_chunk:
+            self._record_transfer_latency()
             self._notify_decode(KVPoll.Success)
             with self._notify_lock:
                 if self.conclude_state is None:
@@ -1484,6 +1495,21 @@ class MoriKVSender(CommonKVSender):
     def _fail_from_worker(self, reason: str) -> None:
         self._finalize_failure(reason)
 
+    def _record_transfer_latency(self) -> None:
+        """Stamp the real transfer latency once, on first success.
+
+        Idempotent: the latency is recorded from the completion site in
+        ``_run_chunk`` (worker thread) and also defended here in ``poll``;
+        whichever observes success first wins, the other is a no-op.
+        """
+        if (
+            self._transfer_start_time is not None
+            and self._transfer_metric.transfer_latency_s is None
+        ):
+            self._transfer_metric.transfer_latency_s = (
+                time.perf_counter() - self._transfer_start_time
+            )
+
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -1515,6 +1541,7 @@ class MoriKVSender(CommonKVSender):
             return sent_status
 
         if status == KVPoll.Success:
+            self._record_transfer_latency()
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
 
