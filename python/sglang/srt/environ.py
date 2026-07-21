@@ -247,6 +247,12 @@ class Envs:
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Inject per-forward jitter (uniform 0..MS ms) on one PP stage to emulate
+    # uneven/variable cross-stage compute; STAGE is the logical stage (ps.pp_rank)
+    # to slow, -1 disables. Used to compare lockstep (NCCL PP) vs the lock-free
+    # activation ring under stage imbalance.
+    SGLANG_DEBUG_PP_STAGE_JITTER_MS = EnvFloat(0.0)
+    SGLANG_DEBUG_PP_STAGE_JITTER_STAGE = EnvInt(-1)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)

@@ -14,7 +14,6 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.mori.activation import PeerReconnected
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -46,19 +45,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
-class _PPGlobalFlush(Exception):
-    """Raised on a (non-adjacent) surviving stage when it learns, via the
-    ring flush-generation heartbeat, that some other stage restarted and the
-    whole pipeline must drop its KV/radix state to the empty baseline.
-
-    Carries the target flush generation so the handler adopts it *without*
-    re-originating a new flush (which would never converge)."""
-
-    def __init__(self, target_gen: int):
-        super().__init__(f"PP global flush requested (gen={target_gen})")
-        self.target_gen = target_gen
-
-
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -79,16 +65,11 @@ class PPBatchMetadata:
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
-        """Reconnect-resilient wrapper around the PP scheduler loop."""
-        if not self.server_args.pp_stage_disaggregation:
-            return self._event_loop_pp_impl()
-        while True:
-            try:
-                self._event_loop_pp_impl()
-            except PeerReconnected as e:
-                self._pp_handle_reconnect(e)
-            except _PPGlobalFlush as e:
-                self._pp_handle_global_flush(e)
+        """PP scheduler loop. Hot-restart removed: a stage death is a hard crash
+        (the whole prefill/decode group is restarted wholesale), since any single
+        stage restart empties that stage's KV slice and invalidates all in-flight
+        KV across the ring anyway."""
+        return self._event_loop_pp_impl()
 
     @DynamicGradMode()
     def _event_loop_pp_impl(self: Scheduler):
@@ -117,7 +98,6 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
         while True:
-            self._pp_sync_flush_gen()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -203,16 +183,8 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
-        """Reconnect-resilient wrapper: on a neighbor PP stage restart the inner
-        loop raises ``PeerReconnected``; we recover the activation links and
-        re-enter, which re-initializes all per-loop pipeline state."""
-        while True:
-            try:
-                self._event_loop_pp_disagg_prefill_impl()
-            except PeerReconnected as e:
-                self._pp_handle_reconnect(e)
-            except _PPGlobalFlush as e:
-                self._pp_handle_global_flush(e)
+        """PP prefill scheduler loop (hot-restart removed)."""
+        return self._event_loop_pp_disagg_prefill_impl()
 
     @DynamicGradMode()
     def _event_loop_pp_disagg_prefill_impl(self: Scheduler):
@@ -266,7 +238,6 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
-            self._pp_sync_flush_gen()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -409,14 +380,8 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
-        """Reconnect-resilient wrapper for the decode PP loop."""
-        while True:
-            try:
-                self._event_loop_pp_disagg_decode_impl()
-            except PeerReconnected as e:
-                self._pp_handle_reconnect(e)
-            except _PPGlobalFlush as e:
-                self._pp_handle_global_flush(e)
+        """PP decode scheduler loop (hot-restart removed)."""
+        return self._event_loop_pp_disagg_decode_impl()
 
     @DynamicGradMode()
     def _event_loop_pp_disagg_decode_impl(self: Scheduler):
@@ -437,7 +402,6 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
-            self._pp_sync_flush_gen()
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -629,275 +593,6 @@ class SchedulerPPMixin:
 
             if server_is_idle and queue_size == 0:
                 self.on_idle()
-
-    def _pp_handle_reconnect(self: Scheduler, exc: PeerReconnected):
-        """Recover after a neighbor PP stage restarted and re-handshook the
-        activation link(s). The inner loop has unwound; here we (1) wait for the
-        producer link to be healthy again, (2) drop partial pipeline state, and
-        (3) let the inner loop re-enter (which re-inits per-loop state). Requests
-        that were mid-flight on the affected micro-batches are abandoned and the
-        load balancer retries them on a fresh bootstrap room."""
-        logger.warning(
-            "PP stage %d: activation %s-link reconnected (epoch=%d); recovering "
-            "pipeline and resuming.",
-            self.ps.pp_rank,
-            exc.link,
-            exc.epoch,
-        )
-        transport = self.pp_group.transport
-        # Block until our downstream has re-registered (producer link healthy).
-        # Retry across timeouts so a slow neighbor restart does not abort us.
-        while True:
-            try:
-                transport.wait_links_healthy(timeout_s=120.0)
-                break
-            except TimeoutError:
-                logger.warning(
-                    "PP stage %d: still waiting for downstream re-register...",
-                    self.ps.pp_rank,
-                )
-        # Free the KV / req-token pool memory held by every in-flight micro-batch
-        # before we drop the pipeline state. The outer loop re-enters and calls
-        # ``init_pp_loop_state`` which replaces ``mbs``/``running_mbs`` with fresh
-        # empty batches; without this the prefilled-but-abandoned reqs leak their
-        # pool allocations, tripping the scheduler's "pool memory leak detected"
-        # integrity check on the next batch.
-        freed = self._pp_abandon_inflight_reqs()
-        # Drop any partially-prefilled chunk: its activations belong to a dead
-        # epoch and must not be resumed.
-        self.chunked_req = None
-        # Restore the cross-stage KV-state invariant. A restarted neighbor comes
-        # up with an *empty* radix tree / KV pool, while this survivor's caches
-        # are still warm. In PP a prefix may be skipped only if *every* stage
-        # holds its KV; a divergent (warm-vs-empty) prefix set means the producer
-        # would skip a prefix the restarted consumer lacks -> missing-KV / token
-        # mismatch crash. The only state all stages can agree on after a restart
-        # is "empty", so flush this survivor down to the same clean baseline.
-        self._pp_flush_kv_to_empty_baseline()
-        # Originate a global flush generation so that *non-adjacent* stages
-        # (which never saw this link's epoch bump) also drop to the empty
-        # baseline. The bump rides the ring heartbeat in ``_pp_sync_flush_gen``.
-        # Only meaningful for >2 stages; for 2 stages both stages are adjacent
-        # to any restart and already flush here.
-        self._pp_bump_flush_gen()
-        logger.info(
-            "PP stage %d: reconnect recovery done (send_epoch=%d recv_epoch=%d, "
-            "freed %d in-flight reqs, KV flushed to empty baseline, flush_gen=%d).",
-            self.ps.pp_rank,
-            getattr(transport, "send_epoch", 0),
-            getattr(transport, "recv_epoch", 0),
-            freed,
-            self._pp_flush_gen,
-        )
-
-    # -------------------------------------------------- ring-wide flush barrier
-
-    @property
-    def _pp_flush_gen(self: Scheduler) -> int:
-        return getattr(self, "_pp_flush_gen_val", 0)
-
-    @_pp_flush_gen.setter
-    def _pp_flush_gen(self: Scheduler, v: int) -> None:
-        self._pp_flush_gen_val = v
-
-    @property
-    def _pp_applied_flush_gen(self: Scheduler) -> int:
-        return getattr(self, "_pp_applied_flush_gen_val", 0)
-
-    @_pp_applied_flush_gen.setter
-    def _pp_applied_flush_gen(self: Scheduler, v: int) -> None:
-        self._pp_applied_flush_gen_val = v
-
-    def _pp_bump_flush_gen(self: Scheduler) -> None:
-        """Mark this stage as the origin of a fresh global flush. We've already
-        flushed locally, so record it as applied; the heartbeat propagates the
-        new generation forward and other stages adopt (but never re-bump) it."""
-        self._pp_flush_gen = max(self._pp_flush_gen, self._pp_applied_flush_gen) + 1
-        self._pp_applied_flush_gen = self._pp_flush_gen
-
-    def _pp_sync_flush_gen(self: Scheduler) -> None:
-        """One full-ring exchange of the flush generation, once per outer loop.
-
-        Gated to >2 stages: with <=2 stages every stage is adjacent to any
-        restart and flushes in ``_pp_handle_reconnect`` directly, so the ring
-        barrier is unnecessary overhead. When a higher generation is observed
-        than this stage has applied, raise ``_PPGlobalFlush`` to unwind into a
-        clean re-init + flush (without re-originating a generation).
-
-        Deadlock-free: every participating stage pushes its generation to the
-        next stage and then pulls the previous stage's, so all pushes are in
-        flight before any pull blocks. A pull that lands on a mid-restart
-        neighbor is interrupted by ``PeerReconnected`` like every other ring op."""
-        if not self.server_args.pp_stage_disaggregation:
-            return
-        if self.ps.pp_size <= 2:
-            return
-        gen = self._pp_flush_gen
-        peer_gen = 0
-        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            self.pp_group.send_pyobj_next(int(gen), tag="flushgen")
-            peer_gen = self.pp_group.recv_pyobj_prev(tag="flushgen")
-        # Mirror the ring pyobj broadcast semantics used elsewhere so every
-        # intra-stage rank agrees on the observed generation.
-        if self.ps.attn_tp_size > 1:
-            peer_gen = broadcast_pyobj(
-                peer_gen,
-                self.attn_tp_group.rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_group.ranks[0],
-            )
-        if self.ps.attn_cp_size > 1:
-            peer_gen = broadcast_pyobj(
-                peer_gen,
-                self.attn_cp_group.rank,
-                self.attn_cp_cpu_group,
-                src=self.attn_cp_group.ranks[0],
-            )
-        observed = max(int(gen), int(peer_gen or 0))
-        self._pp_flush_gen = observed
-        if observed > self._pp_applied_flush_gen:
-            raise _PPGlobalFlush(observed)
-
-    def _pp_handle_global_flush(self: Scheduler, exc: _PPGlobalFlush) -> None:
-        """React to a propagated flush generation: abandon in-flight reqs and
-        drop KV/radix to the empty baseline, then adopt the generation WITHOUT
-        bumping (so propagation converges). Links are healthy here -- this is
-        not a reconnect, just a coordinated cache reset."""
-        logger.warning(
-            "PP stage %d: global flush gen=%d observed; resetting KV to baseline.",
-            self.ps.pp_rank,
-            exc.target_gen,
-        )
-        freed = self._pp_abandon_inflight_reqs()
-        self.chunked_req = None
-        self._pp_flush_kv_to_empty_baseline()
-        self._pp_flush_gen = max(self._pp_flush_gen, exc.target_gen)
-        self._pp_applied_flush_gen = self._pp_flush_gen
-        logger.info(
-            "PP stage %d: global flush done (gen=%d, freed %d in-flight reqs).",
-            self.ps.pp_rank,
-            self._pp_applied_flush_gen,
-            freed,
-        )
-
-    def _pp_flush_kv_to_empty_baseline(self: Scheduler) -> None:
-        """Unconditionally reset the radix cache and memory pools to empty.
-
-        Unlike ``flush_cache`` (which no-ops unless the scheduler is fully idle),
-        this is called from reconnect recovery *after* every in-flight request
-        has already been abandoned and purged, so an unguarded reset is safe and
-        required: it brings this surviving stage's KV state into agreement with
-        the freshly-restarted neighbor (which starts empty), keeping prefix reuse
-        coherent across all PP stages."""
-        self.cur_batch = None
-        self.last_batch = None
-        try:
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
-            if getattr(self, "draft_worker", None):
-                self.draft_worker.clear_cache_pool()
-        except Exception as fe:
-            logger.warning(
-                "PP stage %d: KV flush during reconnect hit an error "
-                "(continuing; state may be partially reset): %s",
-                self.ps.pp_rank,
-                fe,
-            )
-
-    def _pp_abandon_inflight_reqs(self: Scheduler) -> int:
-        """Fully abandon every request still parked in the pipeline at reconnect.
-
-        A neighbor restart resets both stages' micro-batch pipelines to a fresh
-        phase (seq 0 at the new epoch). Any request that was mid-prefill on this
-        (surviving) stage holds a *partial* activation/KV state that no longer
-        lines up with the restarted neighbour's freshly-rebuilt ``positions`` --
-        resuming it makes the producer ship a half-chunk of hidden states whose
-        token count mismatches the consumer's positions (the rotary
-        "query/key/positions must have the same number of tokens" crash).
-
-        So we (1) free their KV + req-token pool allocations and (2) remove them
-        from every queue that survives the loop re-entry (``waiting_queue`` and
-        the disagg prefill queues; ``running_batch``/``mbs``/``running_mbs`` are
-        rebuilt by ``init_pp_loop_state``). The load balancer retries them on a
-        fresh bootstrap room. Deduplicated by ``req_pool_idx``."""
-        from sglang.srt.mem_cache.common import release_kv_cache
-
-        sources: List[Optional[ScheduleBatch]] = []
-        if self.chunked_req is not None:
-            sources.append(ScheduleBatch(reqs=[self.chunked_req]))
-        sources.extend(getattr(self, "mbs", []) or [])
-        sources.extend(getattr(self, "running_mbs", []) or [])
-
-        seen_idx = set()
-        abandoned_rids = set()
-        freed = 0
-        for batch in sources:
-            if batch is None:
-                continue
-            for req in getattr(batch, "reqs", None) or []:
-                rid = getattr(req, "rid", None)
-                if rid is not None:
-                    abandoned_rids.add(rid)
-                idx = getattr(req, "req_pool_idx", None)
-                if idx is None or idx in seen_idx:
-                    continue
-                seen_idx.add(idx)
-                try:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
-                except Exception as ce:  # best-effort: keep freeing the rest
-                    logger.warning(
-                        "PP stage %d: release_kv_cache failed for rid=%s: %s",
-                        self.ps.pp_rank,
-                        rid,
-                        ce,
-                    )
-                # ChunkCache.cache_finished_req frees KV but leaves the req-token
-                # slot; reclaim it here since the req is being discarded.
-                if getattr(req, "req_pool_idx", None) is not None:
-                    self.req_to_token_pool.free(req)
-                freed += 1
-
-        if abandoned_rids:
-            self._pp_purge_reqs_from_queues(abandoned_rids)
-        return freed
-
-    def _pp_purge_reqs_from_queues(self: Scheduler, rids: set) -> None:
-        """Drop abandoned reqs from queues that persist across loop re-entry so
-        they are never re-scheduled with freed KV. Best-effort and defensive:
-        queue attributes differ across disaggregation modes."""
-        wq = getattr(self, "waiting_queue", None)
-        if isinstance(wq, list):
-            self.waiting_queue = [r for r in wq if getattr(r, "rid", None) not in rids]
-
-        inflight = getattr(self, "disagg_prefill_inflight_queue", None)
-        if isinstance(inflight, list):
-            self.disagg_prefill_inflight_queue = [
-                r for r in inflight if getattr(r, "rid", None) not in rids
-            ]
-
-        bootstrap_q = getattr(self, "disagg_prefill_bootstrap_queue", None)
-        inner = getattr(bootstrap_q, "queue", None)
-        if isinstance(inner, list):
-            bootstrap_q.queue = [
-                r for r in inner if getattr(r, "rid", None) not in rids
-            ]
-
-        # Notify the tokenizer so clients/LB see a clean abort and retry, rather
-        # than hanging until timeout. Guarded: a notify failure must not abort
-        # the reconnect recovery itself.
-        try:
-            from sglang.srt.managers.io_struct import AbortReq
-
-            send = self.ipc_channels.send_to_tokenizer
-            for rid in rids:
-                send.send_output(AbortReq(rid=rid), None)
-        except Exception as ne:
-            logger.warning(
-                "PP stage %d: failed to notify tokenizer of abandoned reqs: %s",
-                self.ps.pp_rank,
-                ne,
-            )
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
@@ -1692,6 +1387,15 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        # Debug: emulate uneven/variable cross-stage compute by delaying one
+        # stage's per-microbatch launch. Lockstep PP stalls the whole ring on
+        # each spike; the lock-free activation ring buffers past it.
+        _jit_ms = envs.SGLANG_DEBUG_PP_STAGE_JITTER_MS.get()
+        if (
+            _jit_ms > 0
+            and self.ps.pp_rank == envs.SGLANG_DEBUG_PP_STAGE_JITTER_STAGE.get()
+        ):
+            time.sleep(float(np.random.uniform(0.0, _jit_ms)) / 1000.0)
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)

@@ -55,6 +55,70 @@ _MSG_PYOBJ = b"pyobj"  # control-plane python objects (weight tying / broadcast)
 _MSG_REREGISTER = b"rereg"  # restarted producer -> downstream: "re-register to me"
 
 
+# ---- ring capacity planning (the cross-stage analogue of the KV pool) ---------
+# Budget a small fraction of device memory for the activation ring (both edges),
+# so its depth is *computed* like the KV pool instead of hand-set via
+# --pp-activation-io-buffer-bytes. A deeper ring absorbs traffic surges (more
+# micro-batches in flight before the lock-free producer must credit-stall).
+_ACT_RING_MEM_FRACTION = 0.05  # of total device memory, split across the 2 edges
+_ACT_RING_MAX_SLOTS = 32  # beyond a few x pipeline depth extra slots don't help
+
+
+@dataclasses.dataclass(frozen=True)
+class RingPlan:
+    slot_bytes: int  # bytes for one max-size micro-batch proxy (hidden + residual)
+    num_slots: int  # ring depth: micro-batches in flight per (prev->next) edge
+
+
+def plan_activation_ring(
+    *,
+    hc_hidden_size: int,
+    hidden_size: int,
+    dtype_itemsize: int,
+    chunked_prefill_size: int,
+    max_prefill_tokens: int,
+    pp_num_stages: int,
+    pp_async_batch_depth: int,
+    io_buffer_bytes: int,
+    total_device_memory_mib: float,
+) -> RingPlan:
+    """Size the activation ring the way the KV pool is sized.
+
+    ``slot_bytes`` fits the largest possible micro-batch's proxy tensors
+    (hidden_states + residual for ``max_tokens`` tokens), so a slot never
+    overflows. ``num_slots`` (depth) is auto-derived from a device-memory
+    budget; ``io_buffer_bytes`` (>0) is an optional per-edge override. Depth is
+    floored at the pipeline-depth deadlock minimum and capped.
+    """
+    per_token_bytes = (hc_hidden_size + hidden_size) * dtype_itemsize
+    max_tokens = max(
+        chunked_prefill_size if chunked_prefill_size > 0 else 0,
+        max_prefill_tokens,
+        8192,
+    )
+    slot_bytes = max_tokens * per_token_bytes
+    min_slots = pp_num_stages + pp_async_batch_depth + 2
+
+    if io_buffer_bytes > 0:
+        per_edge_budget = io_buffer_bytes  # explicit override, per edge
+    else:
+        total_bytes = int(total_device_memory_mib * (1 << 20))
+        per_edge_budget = int(_ACT_RING_MEM_FRACTION * total_bytes) // 2
+
+    depth = per_edge_budget // max(slot_bytes, 1)
+    num_slots = max(min_slots, min(int(depth), _ACT_RING_MAX_SLOTS))
+    if depth < min_slots:
+        logger.warning(
+            "activation ring budget yields only %d slots (< pipeline depth %d); "
+            "raising to %d. Increase pp_activation_io_buffer_bytes or reduce "
+            "chunked_prefill_size to avoid credit stalls under load.",
+            int(depth),
+            min_slots,
+            min_slots,
+        )
+    return RingPlan(slot_bytes=int(slot_bytes), num_slots=int(num_slots))
+
+
 class PeerReconnected(Exception):
     """Raised by a blocked transport op (pull / push / credit wait) when the
     affected link re-handshakes at a new epoch because a neighbor stage

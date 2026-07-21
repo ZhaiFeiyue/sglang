@@ -213,6 +213,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_cpu_ids_by_node,
+    get_device_memory_capacity,
     init_custom_process_group,
     is_hip,
     is_host_cpu_arm64,
@@ -1249,7 +1250,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (see set_neighbor_endpoints / set_stage_endpoints); this only stands up
         the engine + ring buffers and the identity surface.
         """
-        from sglang.srt.disaggregation.mori.activation import MoriActivationTransport
+        from sglang.srt.disaggregation.mori.activation import (
+            MoriActivationTransport,
+            plan_activation_ring,
+        )
         from sglang.srt.distributed.mori_pp_group import MoriPPGroup
         from sglang.srt.distributed.parallel_state import set_mori_pp_group
         from sglang.srt.layers.dp_attention import (
@@ -1262,39 +1266,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_stages = sa.pp_num_stages
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-
         mc = self.model_config
-        hc_hidden = getattr(mc, "hc_hidden_size", None) or mc.hidden_size
-        per_token_bytes = (hc_hidden + mc.hidden_size) * mc.dtype.itemsize
-        max_tokens = max(
-            sa.chunked_prefill_size if sa.chunked_prefill_size > 0 else 0,
-            getattr(self, "max_prefill_tokens", 0),
-            8192,
+
+        # Ring capacity is planned (like the KV pool) in the collaborator; the
+        # depth auto-scales from device memory so bursts don't credit-stall.
+        ring = plan_activation_ring(
+            hc_hidden_size=getattr(mc, "hc_hidden_size", None) or mc.hidden_size,
+            hidden_size=mc.hidden_size,
+            dtype_itemsize=mc.dtype.itemsize,
+            chunked_prefill_size=sa.chunked_prefill_size,
+            max_prefill_tokens=getattr(self, "max_prefill_tokens", 0),
+            pp_num_stages=sa.pp_num_stages,
+            pp_async_batch_depth=sa.pp_async_batch_depth,
+            io_buffer_bytes=sa.pp_activation_io_buffer_bytes,
+            total_device_memory_mib=(get_device_memory_capacity(self.device) or 0),
         )
-        slot_bytes = max_tokens * per_token_bytes
-
-        # Capacity model: the activation ring is the cross-stage analogue of the
-        # KV pool. ``num_slots`` is the number of microbatches that can be in
-        # flight on one (prev->next) edge. To keep the lockstep pipeline from
-        # self-deadlocking it must cover the full pipeline depth plus the async
-        # batch-depth lookahead, with a small margin.
-        min_slots = sa.pp_num_stages + sa.pp_async_batch_depth + 2
-        if sa.pp_activation_io_buffer_bytes > 0:
-            num_slots = max(2, sa.pp_activation_io_buffer_bytes // max(slot_bytes, 1))
-            if num_slots < min_slots:
-                logger.warning(
-                    "pp_activation_io_buffer_bytes=%d yields only %d ring slots "
-                    "(< pipeline depth %d); raising to %d to avoid stalls. "
-                    "Increase the buffer budget or reduce chunked_prefill_size.",
-                    sa.pp_activation_io_buffer_bytes,
-                    num_slots,
-                    min_slots,
-                    min_slots,
-                )
-                num_slots = min_slots
-        else:
-            num_slots = min_slots
-
         use_xgmi = self._resolve_pp_activation_xgmi()
 
         transport = MoriActivationTransport(
@@ -1305,8 +1291,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             gpu_id=self.gpu_id,
             device=self.device,
             ib_device=sa.pp_activation_ib_device,
-            max_slot_bytes=int(slot_bytes),
-            num_slots=int(num_slots),
+            max_slot_bytes=ring.slot_bytes,
+            num_slots=ring.num_slots,
             use_xgmi=use_xgmi,
         )
         group = MoriPPGroup(
@@ -1326,9 +1312,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             attn_tp_rank,
             attn_tp_size,
             "xgmi" if use_xgmi else "rdma",
-            int(slot_bytes),
-            int(num_slots),
-            (2 * int(slot_bytes) * int(num_slots)) / (1 << 30),
+            ring.slot_bytes,
+            ring.num_slots,
+            (2 * ring.slot_bytes * ring.num_slots) / (1 << 30),
         )
 
     def _resolve_pp_activation_xgmi(self) -> bool:

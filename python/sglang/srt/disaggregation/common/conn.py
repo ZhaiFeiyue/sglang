@@ -178,12 +178,6 @@ class CommonKVManager(BaseKVManager):
                 self.bootstrap_port
             )
             self.register_to_bootstrap()
-            # Re-register periodically so that if the (entry-stage-hosted)
-            # bootstrap server is restarted, every stage re-populates it without
-            # operator intervention. Registration is idempotent: the server only
-            # bumps its generation when our rank_port actually changes, so this
-            # never triggers spurious decode-side cache invalidation.
-            self._start_periodic_reregister()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
@@ -397,27 +391,6 @@ class CommonKVManager(BaseKVManager):
                 f"(world_rank={world_group.rank_in_group})"
             )
         return synced_port
-
-    def _start_periodic_reregister(self, interval_s: float = 10.0):
-        """Periodically re-PUT this prefill rank's info to the bootstrap server.
-
-        Makes KV-transport discovery resilient to a bootstrap-server (entry
-        stage) restart: every stage keeps re-advertising itself, so a freshly
-        restarted server is re-populated within ``interval_s``."""
-
-        def _loop():
-            while True:
-                time.sleep(interval_s)
-                try:
-                    self.register_to_bootstrap()
-                except Exception:
-                    logger.debug(
-                        "Periodic bootstrap re-registration failed", exc_info=True
-                    )
-
-        threading.Thread(
-            target=_loop, daemon=True, name="kv-bootstrap-reregister"
-        ).start()
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
