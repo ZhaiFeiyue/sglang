@@ -32,6 +32,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import queue
 import threading
 import time
 import uuid
@@ -165,6 +166,23 @@ class _Slot:
     in_use: bool = False
 
 
+@dataclasses.dataclass
+class _SendTask:
+    """A staged send handed to the background sender thread. The staging copy is
+    already enqueued on the scheduler's CUDA stream; ``ready`` fires when it (and
+    the producing forward) completes, so the sender waits off the critical path
+    instead of the scheduler doing a per-hop full stream sync."""
+
+    msg_key: str
+    send_slot_id: int
+    layouts: List["TensorLayout"]
+    total: int
+    extras: Optional[dict]
+    ready: "torch.cuda.Event"
+    push_epoch: int
+    timeout_s: Optional[float]
+
+
 def _dtype_to_str(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
@@ -227,6 +245,10 @@ class MoriActivationTransport:
         self.max_slot_bytes = int(max_slot_bytes)
         self.num_slots = int(num_slots)
         self.use_xgmi = use_xgmi
+        # Dedicated stream for the send staging copy so it never sits on the
+        # scheduler's compute stream (keeps the forward pipeline unblocked; the
+        # copy still waits on the forward output via wait_stream).
+        self._copy_stream = torch.cuda.Stream(device=device)
 
         self.is_first = stage_id == 0
         self.is_last = stage_id == num_stages - 1
@@ -247,6 +269,10 @@ class MoriActivationTransport:
         self._free_recv: "deque[int]" = deque()
         self._recv_lock = threading.Condition()
         self._ready: Dict[str, SlotMessage] = {}
+        # Per-key wakeups: a pull() waiting on msg_key registers an Event here so
+        # _on_data wakes ONLY that waiter instead of notify_all-ing every waiter
+        # (thundering herd once there are many concurrent pulls, e.g. attn_tp>1).
+        self._ready_events: Dict[str, threading.Event] = {}
 
         # Control-plane python-object inbox keyed by msg_key (small messages
         # for weight tying / broadcast_object_list; not RDMA).
@@ -261,6 +287,25 @@ class MoriActivationTransport:
         self._send_slots: List[_Slot] = []
         self._free_send: "deque[int]" = deque()
         self._send_lock = threading.Condition()
+        # Background sender: the scheduler stages the copy + enqueues here, a
+        # single worker thread does the (blocking) stream wait + RDMA write + ZMQ
+        # notify off the critical path (mirrors the PD KV-transfer worker). One
+        # thread preserves per-stream send ordering (seq-keyed messages).
+        self._send_queue: "queue.Queue[_SendTask]" = queue.Queue()
+        threading.Thread(
+            target=self._sender_worker,
+            daemon=True,
+            name=f"act-send-s{self.stage_id}-t{attn_tp_rank}",
+        ).start()
+        # Background releaser: returns a *borrowed* (zero-copy) recv slot to the
+        # producer once the consuming forward's CUDA event completes -- off the
+        # scheduler critical path. Enqueued via release_slot_after().
+        self._release_queue: "queue.Queue" = queue.Queue()
+        threading.Thread(
+            target=self._releaser_worker,
+            daemon=True,
+            name=f"act-rel-s{self.stage_id}-t{attn_tp_rank}",
+        ).start()
         # downstream peer registration: single remote recv-block MemoryDesc; a
         # remote slot id addresses into it at (slot_id * peer_slot_bytes).
         self._peer_engine_desc = None
@@ -299,6 +344,13 @@ class MoriActivationTransport:
         self._stat_credit_wait_s = 0.0
         self._stat_pyobj_sent = 0
         self._stat_pyobj_recv = 0
+        # Per-phase timing to locate the PP bottleneck (cumulative seconds):
+        #   pull_wait  = consumer blocked in pull() waiting for upstream data
+        #   ready_wait = sender thread blocked on the staging-copy CUDA event
+        #   rdma       = sender thread in batch_write + wait_all (one-sided write)
+        self._stat_pull_wait_s = 0.0
+        self._stat_ready_wait_s = 0.0
+        self._stat_rdma_s = 0.0
 
         self._init_engine()
         self._alloc_buffers()
@@ -487,6 +539,8 @@ class MoriActivationTransport:
         self._recv_epoch = epoch
         with self._recv_lock:
             self._recv_lock.notify_all()
+            for ev in self._ready_events.values():
+                ev.set()
         with self._pyobj_lock:
             self._pyobj_lock.notify_all()
 
@@ -510,6 +564,8 @@ class MoriActivationTransport:
             for s in self._recv_slots:
                 s.in_use = False
             self._recv_lock.notify_all()
+            for ev in self._ready_events.values():
+                ev.set()
         with self._pyobj_lock:
             if self._pyobj_inbox:
                 logger.info(
@@ -630,25 +686,54 @@ class MoriActivationTransport:
         sm = msgspec.msgpack.decode(payload[0], type=SlotMessage)
         with self._recv_lock:
             self._ready[sm.msg_key] = sm
-            self._recv_lock.notify_all()
+            ev = self._ready_events.get(sm.msg_key)
+        # Wake only the waiter for this key (Event.set is sticky, so a pull that
+        # registers its Event just after we mark ready still returns immediately).
+        if ev is not None:
+            ev.set()
 
     def pull(
-        self, msg_key: str, timeout_s: Optional[float] = None
+        self, msg_key: str, timeout_s: Optional[float] = None, borrow: bool = False
     ) -> Tuple[Dict[str, torch.Tensor], dict]:
         """Block until the message for ``msg_key`` arrives; return
-        (tensor_dict, extras). Caller must call ``release_slot`` after copying
-        the tensors out (they alias the ring buffer)."""
+        (tensor_dict, slot_handle).
+
+        borrow=False (default): tensors are cloned out of the recv slot, so the
+        caller may ``release_slot`` immediately.
+        borrow=True (zero-copy): tensors are *views* aliasing the recv slot -- no
+        clone, saves HBM -- so the caller MUST keep the slot until the consumer
+        (forward) has read them, then ``release_slot`` / ``release_slot_after``.
+        Using a borrowed slot after release is a use-after-free."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         start_epoch = self._recv_epoch
+        _wait_t0 = time.monotonic()
         with self._recv_lock:
-            while msg_key not in self._ready:
-                if self._recv_epoch != start_epoch:
-                    raise PeerReconnected("recv", self._recv_epoch)
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    raise TimeoutError(f"activation pull timed out for {msg_key}")
-                self._recv_lock.wait(timeout=remaining)
-            sm = self._ready.pop(msg_key)
+            sm = self._ready.pop(msg_key, None)
+            if sm is None:
+                ev = self._ready_events.get(msg_key)
+                if ev is None:
+                    ev = threading.Event()
+                    self._ready_events[msg_key] = ev
+        while sm is None:
+            if self._recv_epoch != start_epoch:
+                with self._recv_lock:
+                    self._ready_events.pop(msg_key, None)
+                raise PeerReconnected("recv", self._recv_epoch)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                with self._recv_lock:
+                    self._ready_events.pop(msg_key, None)
+                raise TimeoutError(f"activation pull timed out for {msg_key}")
+            # Cap the wait so an epoch bump (reconnect) is noticed even if the
+            # per-key Event is never set for this key.
+            ev.wait(timeout=(min(remaining, 1.0) if remaining is not None else 1.0))
+            with self._recv_lock:
+                sm = self._ready.pop(msg_key, None)
+                if sm is not None:
+                    self._ready_events.pop(msg_key, None)
+                else:
+                    ev.clear()
+        self._stat_pull_wait_s += time.monotonic() - _wait_t0
 
         self._stat_pulls += 1
         slot = self._recv_slots[sm.slot_id]
@@ -659,10 +744,11 @@ class MoriActivationTransport:
             for d in t.shape:
                 n *= d
             flat = slot.buffer[t.offset : t.offset + t.nbytes]
-            # view raw bytes as the target dtype/shape, then clone so the slot
-            # can be recycled independently of the consumer's lifetime.
+            # view raw bytes as the target dtype/shape. clone() decouples the
+            # slot from the consumer's lifetime; borrow=True skips it (zero-copy,
+            # saves HBM) and defers slot release until the forward has consumed it.
             view = flat.view(dtype)[:n].reshape(t.shape)
-            tensor_dict[t.key] = view.clone()
+            tensor_dict[t.key] = view if borrow else view.clone()
         extras = msgspec.msgpack.decode(sm.extras) if sm.extras else {}
         # Stamp the handle with the epoch the slot was pulled under. ``pull``
         # already aborts (PeerReconnected) if the epoch bumps mid-wait, so this
@@ -698,6 +784,25 @@ class MoriActivationTransport:
                 )
                 return
         self._grant_credits(upstream_endpoint, [slot_id])
+
+    def release_slot_after(self, slot_handle, event) -> None:
+        """Defer release of a borrowed (zero-copy) recv slot until ``event``
+        (the consuming forward) completes. Runs on the releaser thread so the
+        scheduler never blocks; the slot's views stay valid until the GPU has
+        finished reading them."""
+        self._release_queue.put((slot_handle, event))
+
+    def _releaser_worker(self) -> None:
+        while True:
+            slot_handle, event = self._release_queue.get()
+            try:
+                if event is not None:
+                    event.synchronize()
+                self.release_slot(slot_handle, self.upstream_endpoint)
+            except Exception:
+                logger.exception(
+                    "activation stage %d: releaser worker failed", self.stage_id
+                )
 
     # ---------------------------------------------------- producer-side send
 
@@ -852,9 +957,12 @@ class MoriActivationTransport:
         extras: Optional[dict] = None,
         timeout_s: Optional[float] = None,
     ):
-        """Copy ``tensor_dict`` into a staging slot, ``batch_write`` it into a
-        granted downstream recv slot, then notify the consumer. Blocks on credit
-        when the downstream ring is full (back-pressure)."""
+        """Scheduler-side: stage ``tensor_dict`` into a send slot, record a CUDA
+        event marking when the staging copy (and the producing forward) is done,
+        and hand the RDMA transmit to the background sender thread. Returns
+        without a stream sync so the scheduler keeps the GPU pipeline full
+        (compute/comm overlap) -- the per-hop blocking sync + one-sided write now
+        run off the critical path in ``_transmit`` (mirrors the PD KV worker)."""
         if self._peer_engine_desc is None:
             raise RuntimeError("activation push before downstream registered")
         if self._producer_broken:
@@ -866,63 +974,109 @@ class MoriActivationTransport:
         # reconnect reset the producer state mid-push (see _release_send_slot).
         push_epoch = self._send_epoch
 
-        # Pack into a local staging slot *before* acquiring a downstream credit:
-        # a slot-overflow (misconfiguration) then costs no credit, so it cannot
-        # silently deplete the credit pool and deadlock the producer.
+        # Acquire a staging slot up front (bounded by num_slots -> this is the
+        # producer back-pressure, now the only thing that can block the
+        # scheduler, and only when the sender thread is genuinely behind).
         send_slot_id = self._acquire_send_slot()
         send_slot = self._send_slots[send_slot_id]
 
-        # Pack tensors contiguously into the staging buffer; build layout.
+        # Pack tensors contiguously into the staging buffer on a DEDICATED copy
+        # stream (not the compute stream), so staging never delays the next
+        # forward. wait_stream makes the copy wait for the forward output.
         layouts: List[TensorLayout] = []
         offset = 0
+        self._copy_stream.wait_stream(torch.cuda.current_stream())
         try:
-            for key, tensor in tensor_dict.items():
-                t = tensor.contiguous()
-                nbytes = t.numel() * t.element_size()
-                if offset + nbytes > self.max_slot_bytes:
-                    raise RuntimeError(
-                        f"activation slot overflow: need {offset + nbytes} > "
-                        f"{self.max_slot_bytes}; increase "
-                        "pp_activation_io_buffer_bytes"
+            with torch.cuda.stream(self._copy_stream):
+                for key, tensor in tensor_dict.items():
+                    t = tensor.contiguous()
+                    nbytes = t.numel() * t.element_size()
+                    if offset + nbytes > self.max_slot_bytes:
+                        raise RuntimeError(
+                            f"activation slot overflow: need {offset + nbytes} > "
+                            f"{self.max_slot_bytes}; increase "
+                            "pp_activation_io_buffer_bytes"
+                        )
+                    dst = send_slot.buffer[offset : offset + nbytes].view(t.dtype)[
+                        : t.numel()
+                    ]
+                    dst.copy_(t.reshape(-1))
+                    layouts.append(
+                        TensorLayout(
+                            key=key,
+                            shape=list(t.shape),
+                            dtype=_dtype_to_str(t.dtype),
+                            offset=offset,
+                            nbytes=nbytes,
+                        )
                     )
-                dst = send_slot.buffer[offset : offset + nbytes].view(t.dtype)[
-                    : t.numel()
-                ]
-                dst.copy_(t.reshape(-1))
-                layouts.append(
-                    TensorLayout(
-                        key=key,
-                        shape=list(t.shape),
-                        dtype=_dtype_to_str(t.dtype),
-                        offset=offset,
-                        nbytes=nbytes,
-                    )
-                )
-                offset += nbytes
+                    offset += nbytes
         except Exception:
             self._release_send_slot(send_slot_id, push_epoch)
             raise
 
-        total = offset
-        torch.cuda.current_stream().synchronize()
+        # Mark when the staging copy completes on the copy stream; the sender
+        # thread waits on THIS event instead of a full compute-stream sync.
+        ready = torch.cuda.Event()
+        ready.record(self._copy_stream)
+        self._send_queue.put(
+            _SendTask(
+                msg_key=msg_key,
+                send_slot_id=send_slot_id,
+                layouts=layouts,
+                total=offset,
+                extras=extras,
+                ready=ready,
+                push_epoch=push_epoch,
+                timeout_s=timeout_s,
+            )
+        )
 
-        # Now reserve a downstream recv slot (blocks under back-pressure).
-        remote_slot_id = self._acquire_credit(timeout_s)
+    def _sender_worker(self) -> None:
+        """Drain staged sends: wait for the copy event, one-sided-write into the
+        downstream recv slot, notify. Off the scheduler critical path so hops
+        overlap with compute. Single thread => FIFO preserves send seq order."""
+        while True:
+            task = self._send_queue.get()
+            try:
+                self._transmit(task)
+            except PeerReconnected:
+                # Link marked broken inside _transmit; the scheduler observes the
+                # reconnect on its next ring op. Nothing to do here.
+                pass
+            except Exception:
+                logger.exception(
+                    "activation stage %d: sender worker failed for %s",
+                    self.stage_id,
+                    task.msg_key,
+                )
+                self._release_send_slot(task.send_slot_id, task.push_epoch)
+
+    def _transmit(self, task: _SendTask) -> None:
+        # Wait (off critical path) for the staging copy to be visible to RDMA.
+        _rt0 = time.monotonic()
+        task.ready.synchronize()
+        self._stat_ready_wait_s += time.monotonic() - _rt0
+        send_slot = self._send_slots[task.send_slot_id]
+
+        # Reserve a downstream recv slot (blocks under back-pressure -- in this
+        # worker thread, not the scheduler).
+        remote_slot_id = self._acquire_credit(task.timeout_s)
 
         # One-sided RDMA write from our send block (at this region's offset) into
-        # the peer's single recv block (at the granted region's offset). Both
-        # sides are one registered allocation; the slot id selects the byte
-        # offset within it.
+        # the peer's single recv block (at the granted region's offset).
+        _wt0 = time.monotonic()
         uid = self.engine.allocate_transfer_uid()
         statuses = self.engine.batch_write(
             [self._send_block_desc],
             [[send_slot.offset]],
             [self._peer_recv_block_desc],
             [[remote_slot_id * self._peer_slot_bytes]],
-            [[total]],
+            [[task.total]],
             [uid],
         )
         self.engine.wait_all(statuses)
+        self._stat_rdma_s += time.monotonic() - _wt0
         for st in statuses:
             if st.Failed():
                 # The remote slot was never notified to the consumer, so it is
@@ -931,7 +1085,7 @@ class MoriActivationTransport:
                 # gone (crashed/restarting): mark the producer link broken so
                 # the scheduler treats this as a reconnect, not a hard error.
                 self._return_credit(remote_slot_id)
-                self._release_send_slot(send_slot_id, push_epoch)
+                self._release_send_slot(task.send_slot_id, task.push_epoch)
                 self._producer_broken = True
                 self._peer_registered.clear()
                 logger.warning(
@@ -942,20 +1096,20 @@ class MoriActivationTransport:
                 )
                 raise PeerReconnected("send", self._send_epoch)
 
-        self._release_send_slot(send_slot_id, push_epoch)
+        self._release_send_slot(task.send_slot_id, task.push_epoch)
 
         sm = SlotMessage(
-            msg_key=msg_key,
+            msg_key=task.msg_key,
             slot_id=remote_slot_id,
-            total_bytes=total,
-            tensors=layouts,
-            extras=msgspec.msgpack.encode(extras) if extras else b"",
+            total_bytes=task.total,
+            tensors=task.layouts,
+            extras=msgspec.msgpack.encode(task.extras) if task.extras else b"",
         )
         self._connect(self._peer_endpoint).send_multipart(
             [ACT_GUARD, _MSG_DATA, msgspec.msgpack.encode(sm)]
         )
         self._stat_pushes += 1
-        self._stat_bytes_written += total
+        self._stat_bytes_written += task.total
 
     # ----------------------------------------------------------- observability
 
@@ -978,6 +1132,9 @@ class MoriActivationTransport:
             "bytes_written": self._stat_bytes_written,
             "credit_stalls": self._stat_credit_stalls,
             "credit_wait_s": round(self._stat_credit_wait_s, 4),
+            "pull_wait_s": round(self._stat_pull_wait_s, 4),
+            "ready_wait_s": round(self._stat_ready_wait_s, 4),
+            "rdma_s": round(self._stat_rdma_s, 4),
             "pyobj_sent": self._stat_pyobj_sent,
             "pyobj_recv": self._stat_pyobj_recv,
             "num_slots": self.num_slots,

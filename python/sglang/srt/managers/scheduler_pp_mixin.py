@@ -1143,11 +1143,13 @@ class SchedulerPPMixin:
         expected_kind: str = "default",
         all_gather_group: Optional = None,
         batch_key: Optional[str] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Receive a typed tensor dict, demultiplexing by msg_type.
+        borrow: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
+        """Receive a typed tensor dict; returns (dict, release_handle).
 
-        If a message of the wrong kind is received, it's stashed in the queue
-        and we continue receiving until we get the expected kind.
+        ``release_handle`` is non-None only for a borrowed (zero-copy) recv whose
+        tensors alias the recv slot; the caller must release it after the
+        consumer has read them. Otherwise it is None.
         """
         # Stage disaggregation: the virtual mori PP group is keyed by
         # (msg_type, seq) -- or by ``batch_key`` (micro-batch identity) when
@@ -1157,12 +1159,13 @@ class SchedulerPPMixin:
                 msg_type=expected_kind,
                 all_gather_group=all_gather_group,
                 batch_key=batch_key,
+                borrow=borrow,
             )
 
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
-                return inbox_queue.popleft()
+                return inbox_queue.popleft(), None
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
@@ -1175,7 +1178,7 @@ class SchedulerPPMixin:
                         f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
                         "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
                     )
-                return tensor_dict
+                return tensor_dict, None
             else:
                 logger.debug(
                     f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
@@ -1184,6 +1187,9 @@ class SchedulerPPMixin:
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
+        # Handle for the borrowed (zero-copy) proxy recv slot, released after the
+        # consuming forward in _pp_launch_batch. None on the first rank / non-borrow.
+        self._pp_pending_recv_handle = None
         if not self.pp_group.is_first_rank:
             # Content-address the proxy by the batch we just built so it pairs
             # with the producer's matching batch irrespective of pipeline phase
@@ -1193,26 +1199,30 @@ class SchedulerPPMixin:
                 if self.server_args.pp_stage_disaggregation
                 else None
             )
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                    batch_key=batch_key,
-                )
+            proxy_dict, handle = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
+                batch_key=batch_key,
+                borrow=True,  # zero-copy: read hidden_states directly from the recv slot
             )
+            self._pp_pending_recv_handle = handle
+            pp_proxy_tensors = PPProxyTensors(proxy_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
-        return self._pp_recv_typed_dict(
+        # Output ring carries tiny next_token_ids -> keep the clone (borrow=False);
+        # the HBM win is on the big proxy (hidden_states) ring only.
+        out, _ = self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(
                 self.attn_tp_group if self.require_attn_tp_allgather else None
             ),
         )
+        return out
 
     def _pp_make_skip_output_result(
         self: Scheduler,
@@ -1416,6 +1426,15 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                # Zero-copy proxy recv: the forward has now read hidden_states
+                # from the borrowed recv slot; release it once this event
+                # completes (off the scheduler thread, via the releaser worker).
+                handle = getattr(self, "_pp_pending_recv_handle", None)
+                if handle is not None:
+                    transport = getattr(self.pp_group, "transport", None)
+                    if transport is not None:
+                        transport.release_slot_after(handle, event)
+                    self._pp_pending_recv_handle = None
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

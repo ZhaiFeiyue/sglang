@@ -218,11 +218,17 @@ class MoriPPGroup:
         msg_type: str,
         all_gather_group=None,
         batch_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Receive a tensor dict of ``msg_type``.
+        borrow: bool = False,
+    ) -> Tuple[Dict[str, Any], Any]:
+        """Receive a tensor dict of ``msg_type``. Returns (out, release_handle).
 
-        With ``batch_key`` the pull is content-addressed by micro-batch
-        identity (see ``send_tensor_dict``); otherwise it is sequence-matched.
+        With ``batch_key`` the pull is content-addressed by micro-batch identity
+        (see ``send_tensor_dict``); otherwise it is sequence-matched.
+
+        borrow=True + no attn-TP all-gather => ``out`` tensors are zero-copy views
+        aliasing the recv slot (saves HBM); ``release_handle`` is the slot to
+        release AFTER the consumer has read them (via ``release_slot_after``).
+        Otherwise the slot is released here and ``release_handle`` is None.
         """
         epoch = self._recv_epoch()
         if batch_key is not None:
@@ -231,12 +237,14 @@ class MoriPPGroup:
             seq = self._recv_seq[msg_type]
             self._recv_seq[msg_type] += 1
             key = f"{epoch}:{msg_type}:{seq}"
-        tensors, slot_handle = self.transport.pull(key)
+        tensors, slot_handle = self.transport.pull(key, borrow=borrow)
         extras = slot_handle[-1]
+        up = getattr(self.transport, "upstream_endpoint", None) or self.upstream_endpoint
         try:
             ag_size = 1 if all_gather_group is None else all_gather_group.world_size
             orig_shapes = extras.get("orig_shapes", {})
             out: Dict[str, Any] = {}
+            aliases_slot = False
             for k, t in tensors.items():
                 orig = orig_shapes.get(k)
                 if (
@@ -247,19 +255,22 @@ class MoriPPGroup:
                     and t.numel() == _numel(orig) // ag_size
                 ):
                     gathered = all_gather_group.all_gather(t, dim=0)
-                    out[k] = gathered.reshape(orig)
+                    out[k] = gathered.reshape(orig)  # fresh copy, does not alias slot
                 else:
                     out[k] = t if orig is None else t.reshape(orig)
+                    if borrow:
+                        aliases_slot = True  # this tensor is a view into the slot
             for k, v in extras.get("scalars", {}).items():
                 out[k] = v
             out["__msg_type__"] = extras.get("msg_type", msg_type)
-            return out
-        finally:
-            up = (
-                getattr(self.transport, "upstream_endpoint", None)
-                or self.upstream_endpoint
-            )
+        except Exception:
             self.transport.release_slot(slot_handle, up)
+            raise
+        if aliases_slot:
+            # Zero-copy: defer release until the consumer (forward) is done.
+            return out, slot_handle
+        self.transport.release_slot(slot_handle, up)
+        return out, None
 
     # ------------------------------------------------- ring pyobj (reqs/rids)
 
