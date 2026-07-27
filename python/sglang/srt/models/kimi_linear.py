@@ -113,6 +113,9 @@ class KimiMoE(nn.Module):
             layer_id=self.layer_idx,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            activation=config.hidden_act,
+            gemm1_alpha=config.activation_situ_beta,
+            gemm1_clamp_limit=config.activation_situ_linear_beta,
             prefix=add_prefix("experts", prefix),
         )
 
