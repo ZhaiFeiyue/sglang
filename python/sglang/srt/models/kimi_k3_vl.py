@@ -38,6 +38,10 @@ from sglang.srt.utils import get_bool_env_var, is_hip, print_info_once
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.ops.triton.conv.conv2d import conv2d as aiter_conv2d
+
 _SM103_TRITON_MAX_SEQLEN = 1536
 _SM103_FA4_MIN_ATTENTION_WORK = 3_000_000
 
@@ -435,9 +439,12 @@ class MoonViTEncoderLayer(nn.Module):
         self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
         self.attention_backend = attention_backend
         if attention_backend == "auto":
-            implementation_backends = (
-                ("triton_attn", "fa4") if torch.cuda.is_available() else ()
-            )
+            if not torch.cuda.is_available():
+                implementation_backends = ()
+            elif _is_hip:
+                implementation_backends = ("triton_attn",)
+            else:
+                implementation_backends = ("triton_attn", "fa4")
         elif attention_backend == "sdpa":
             implementation_backends = ()
         else:
