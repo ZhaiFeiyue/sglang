@@ -1,0 +1,48 @@
+---
+title: Kimi-K3
+metatags:
+    description: "Deploy Kimi-K3 with SGLang on AMD MI355X - launch command and configuration guide."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+Kimi-K3 is Moonshot AI's next-generation agentic model built on a hybrid linear-attention architecture. It combines Kimi Delta Attention (KDA) with global MLA layers and a large-scale MoE backbone for high-throughput long-context inference.
+
+This page documents an initial deployment recipe on AMD Instinct MI355X.
+
+## 2. SGLang Installation
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration (AMD MI355X)
+
+Launch the server on an 8×MI355X node with tensor parallelism 8:
+
+```shell Command
+SGLANG_USE_AITER=1 \
+SGLANG_KDA_FUSED_DECODE=0 \
+SGLANG_AITER_K3_OPT=1 \
+AITER_FLYDSL_FORCE=1 \
+AITER_SITUV2_A8W4=1 \
+sglang serve \
+  --model-path Kimi-K3 \
+  --trust-remote-code \
+  --enable-multimodal \
+  --tp 8 \
+  --attention-backend triton \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.90 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs 128 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, see [Basic API Usage](../../../docs/basic_usage/send_request).
