@@ -45,7 +45,7 @@ def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
     """KDA decode-fallback default for Kimi hybrid models (spec-independent)."""
     from sglang.srt.utils import is_sm100_supported
 
-    # Pre-empts the generic SM100+bf16 flashinfer switch (a GDN default): on
+    # Preempts the generic SM100+bf16 flashinfer switch (a GDN default): on
     # KDA shapes the triton packed decode measures ~35% faster than
     # recurrent_kda across bs 1-256, and ReplaySSM requires triton.
     if (
