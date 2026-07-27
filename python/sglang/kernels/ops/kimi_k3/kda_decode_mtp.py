@@ -146,7 +146,9 @@ def kda_decode_mtp_kernel(
     )
     # Sized for whichever is larger: both v-tiles of recurrent state (phase 2)
     # or the two conv windows (phase 1). The phases never overlap.
-    r_state_elems = max(num_v_tiles * P2_BATCHES * P2_VEC, 2 * (KERNEL_WIDTH - 1) * vec_size)
+    r_state_elems = max(
+        num_v_tiles * P2_BATCHES * P2_VEC, 2 * (KERNEL_WIDTH - 1) * vec_size
+    )
     r_state = cute.make_rmem_tensor(
         cute.make_layout((r_state_elems,), stride=(1,)), cutlass.Float32
     )
@@ -247,8 +249,12 @@ def kda_decode_mtp_kernel(
             for _pi in cutlass.range(cutlass.min(p1_par, n_tok)):
                 for i in range(vec_size):
                     _xn = cutlass.Float32(x_k[0, bos + _pi, i_hv, i * 32 + in_warp_tid])
-                    r_state[(KERNEL_WIDTH - 1) * vec_size + 0 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i]
-                    r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i]
+                    r_state[(KERNEL_WIDTH - 1) * vec_size + 0 * vec_size + i] = r_state[
+                        (KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i
+                    ]
+                    r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i] = r_state[
+                        (KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i
+                    ]
                     r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i] = _xn
         for i_t in cutlass.range(p1_par, T_loop, P1_JOB_WARPS):
             token = bos + cutlass.min(i_t, n_tok - 1)
@@ -400,8 +406,12 @@ def kda_decode_mtp_kernel(
                     _nx = bos + cutlass.min(i_t + 1 + _a, T_loop - 1)
                     for i in range(vec_size):
                         _xn = cutlass.Float32(x_k[0, _nx, i_hv, i * 32 + in_warp_tid])
-                        r_state[(KERNEL_WIDTH - 1) * vec_size + 0 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i]
-                        r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i]
+                        r_state[(KERNEL_WIDTH - 1) * vec_size + 0 * vec_size + i] = (
+                            r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i]
+                        )
+                        r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i] = (
+                            r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i]
+                        )
                         r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i] = _xn
     else:
         for _c in range(V_CH_PER_THREAD):
@@ -564,9 +574,7 @@ def kda_decode_mtp_kernel(
                 sumsq += cute.arch.shuffle_sync_bfly(
                     sumsq, offset=offset, mask=-1, mask_and_clamp=31
                 )
-            rms = cute.math.rsqrt(
-                sumsq / cutlass.Float32(V) + onorm_eps, fastmath=True
-            )
+            rms = cute.math.rsqrt(sumsq / cutlass.Float32(V) + onorm_eps, fastmath=True)
             for i in range(V // 32):
                 v_idx = i * 32 + in_warp_tid
                 raw_o = sOall[i_t * V + v_idx]
@@ -698,7 +706,6 @@ def _run_kda_decode_mtp_dspark(
         stream=stream,
         use_pdl=True,
     )
-
 
 
 def _block_threads(*, H: int, N: int) -> int:

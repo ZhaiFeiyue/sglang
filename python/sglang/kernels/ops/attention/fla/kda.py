@@ -28,8 +28,8 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     check_shared_mem,
     is_intel,
-    is_tf32_supported,
     is_nvidia,
+    is_tf32_supported,
 )
 
 if is_intel:

@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -862,12 +861,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
                 and getattr(layer.moe_runner_config, "activation", None) == "situ"
             )
-            use_aiter_gu_interleave = (
-                k3_situ_a8w4
-                or (
-                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                    and gate_up_interleaved
-                )
+            use_aiter_gu_interleave = k3_situ_a8w4 or (
+                envs.SGLANG_USE_AITER_MOE_GU_ITLV.get() and gate_up_interleaved
             )
             if use_aiter_gu_interleave:
                 layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
