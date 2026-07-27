@@ -49,9 +49,14 @@ struct KdaPackedDecodeParams {
 };
 
 __device__ __forceinline__ float warp_allreduce_sum(float v) {
+#if defined(__HIP_PLATFORM_AMD__)
+  constexpr uint64_t kFullMask = 0xffffffffffffffffull;
+#else
+  constexpr uint32_t kFullMask = 0xffffffffu;
+#endif
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
-    v += __shfl_xor_sync(0xffffffffu, v, off);
+    v += __shfl_xor_sync(kFullMask, v, off);
   }
   return v;
 }
