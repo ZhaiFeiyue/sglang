@@ -106,16 +106,19 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import is_blackwell_supported, make_layers
+from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
+    get_bool_env_var,
     rank0_log,
     require_mlp_sync,
     set_weight_attrs,
 )
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
+_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1026,6 +1029,8 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+            router_logits = router_logits.contiguous()
         if num_tokens > 1 and self._moe_front_needs_contiguous:
             routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
@@ -1509,6 +1514,9 @@ class KimiK3DeltaAttention(nn.Module):
         the compiled kernel the stash stays unset and decode keeps the
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
+        if _is_hip:
+            # The fused KDA decode kernel is NVIDIA-only
+            return
         layer = self.attn
         w = layer.conv_weights
         seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
