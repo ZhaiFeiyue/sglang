@@ -2340,7 +2340,10 @@ class KimiK3LinearModel(nn.Module):
         #   [2] MLA output-gate GEMM, overlaps the attention core
         # (The attn-res bank write no longer needs a stream: it is fused
         # into the agg1 fast kernel, see AttnResidual.forward(write=True).)
-        self.alt_streams = [torch.cuda.Stream() for _ in range(3)]
+        # Disable on HIP code path.
+        self.alt_streams = (
+            None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
