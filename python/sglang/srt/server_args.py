@@ -3732,46 +3732,6 @@ class ServerArgs:
                     "communication backend (it removes the head-dim Q all-gather); "
                     f"got --dcp-comm-backend={self.dcp_comm_backend}."
                 )
-        if not self.dcp_size > 1:
-            return
-        if is_hip():
-            return
-        elif is_cuda():
-            if self.speculative_algorithm is not None:
-                model_arches = self.get_model_config().hf_config.architectures
-                decode_backend = self.decode_attention_backend or self.attention_backend
-                # Kimi K3 shares Kimi Linear's DCP + DSPARK-static path (same
-                # deepseek_common MLA target-verify + LSE-merge, same aux hidden
-                # capture); both hybrid archs on tokenspeed_mla are validated.
-                # cutedsl_mla routes the same DCP contract through the flashinfer
-                # cute-dsl MLA kernel; it is newly integrated and admitted here so
-                # it can be exercised, but is NOT yet real-weight validated.
-                kimi_hybrid_dspark = (
-                    self.speculative_algorithm == "DSPARK"
-                    and (
-                        "KimiLinearForCausalLM" in model_arches
-                        or "KimiK3ForConditionalGeneration" in model_arches
-                    )
-                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
-                )
-                if not kimi_hybrid_dspark:
-                    raise ValueError(
-                        "Decode context parallel (--dcp-size / "
-                        "--decode-context-parallel-size > 1) with speculative "
-                        "decoding on CUDA is only validated for Kimi Linear / "
-                        "Kimi K3 + DSPARK + tokenspeed_mla (cutedsl_mla is newly "
-                        "integrated, pending validation), but got "
-                        f"architectures={model_arches}, "
-                        f"speculative_algorithm={self.speculative_algorithm!r}, "
-                        f"decode_attention_backend={decode_backend!r}."
-                    )
-        else:
-            raise ValueError(
-                "Decode context parallel (--dcp-size / "
-                "--decode-context-parallel-size > 1) is currently only "
-                f"supported on the AMD HIP platform, but got dcp_size="
-                f"{self.dcp_size} on a non-HIP platform."
-            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):

@@ -114,6 +114,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -812,6 +813,9 @@ class Req(ReqDllmMixin):
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
+        # How much of the think-end marker the output tail matches; the marker
+        # can span several tokens and several decode steps.
+        self._think_end_match_len = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1662,19 +1666,26 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
-    def update_reasoning_tokens(self, token_id, think_end_id):
+    def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
             return
 
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        try:
-            end_pos = token_id.index(think_end_id)
-            self.reasoning_tokens += end_pos + 1
-            self._is_reasoning_over = True
-        except ValueError:
-            self.reasoning_tokens += len(token_id)
+        # The marker may span both several tokens and several decode steps, so
+        # the partial match carries over between calls.
+        matcher = TokenSequenceMatcher(think_end_ids)
+        match = self._think_end_match_len
+        for pos, token in enumerate(token_id):
+            match = matcher.advance(match, token)
+            if match == len(matcher):
+                self.reasoning_tokens += pos + 1
+                self._is_reasoning_over = True
+                return
+
+        self._think_end_match_len = match
+        self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (

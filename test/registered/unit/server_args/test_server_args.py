@@ -376,6 +376,14 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
 
+class TestDCPValidation(unittest.TestCase):
+    def test_speculative_policy_is_not_checked(self):
+        server_args = ServerArgs(model_path="dummy", dcp_size=8)
+        server_args.speculative_algorithm = "DSPARK"
+
+        server_args._handle_dcp_validation()
+
+
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
         server_args = ServerArgs(

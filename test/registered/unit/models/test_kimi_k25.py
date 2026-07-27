@@ -22,6 +22,8 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3GPUProcessorWrapper,
     KimiK3ImageProcessor,
+    _expand_k3_image_prompt_text,
+    _expand_k3_image_prompt_token_ids,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -42,8 +44,13 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _Tokenizer:
-    def encode(self, _text):
-        return []
+    def encode(self, text, allowed_special=None):
+        tokens = {
+            "<|media_begin|>image 1536x1024<|media_content|>": [10, 11],
+            "<|media_begin|>image 1024x1536<|media_content|>": [12, 13],
+            "<|media_end|>": [14],
+        }
+        return tokens.get(text, [])
 
 
 def test_kimi_shared_concat_avoids_single_image_copy():
@@ -284,6 +291,75 @@ def test_kimi_expands_pre_tokenized_image_placeholders(input_ids):
     assert actual.dtype == torch.long
     assert actual.device.type == "cpu"
     assert actual.tolist() == [[1, 99, 99, 99, 2, 99, 99, 3]]
+
+
+def test_kimi_k3_expands_image_placeholders_with_original_dimensions():
+    actual = _expand_k3_image_prompt_token_ids(
+        [1, 99, 2, 99, 3],
+        99,
+        [3, 2],
+        [(1536, 1024), (1024, 1536)],
+        _Tokenizer(),
+    )
+
+    assert actual.tolist() == [[1, 10, 11, 99, 99, 99, 14, 2, 12, 13, 99, 99, 14, 3]]
+
+
+def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
+    actual = _expand_k3_image_prompt_text(
+        "before<|media_pad|>between<|media_pad|>after",
+        "<|media_pad|>",
+        [3, 2],
+        [(1536, 1024), (1024, 1536)],
+    )
+
+    assert actual == (
+        "before<|media_begin|>image 1536x1024<|media_content|>"
+        "<|media_pad|><|media_pad|><|media_pad|><|media_end|>between"
+        "<|media_begin|>image 1024x1536<|media_content|>"
+        "<|media_pad|><|media_pad|><|media_end|>after"
+    )
+
+
+def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.hf_config = SimpleNamespace(
+        vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
+    )
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor._tokenizer = _Tokenizer()
+    embeddings = {Modality.IMAGE: torch.arange(20, dtype=torch.float32).reshape(5, 4)}
+
+    output = processor.get_mm_data(
+        [1, 99, 2, 99, 3],
+        embeddings,
+        img_grid_thw=torch.tensor([[1, 2, 6], [1, 2, 4]]),
+        original_image_sizes=[[1536, 1024], [1024, 1536]],
+    )
+
+    assert output.input_ids == [
+        1,
+        10,
+        11,
+        99,
+        99,
+        99,
+        14,
+        2,
+        12,
+        13,
+        99,
+        99,
+        14,
+        3,
+    ]
+    assert [item.offsets for item in output.mm_items] == [[(3, 5)], [(10, 11)]]
+    torch.testing.assert_close(
+        output.mm_items[0].precomputed_embeddings, embeddings[Modality.IMAGE][:3]
+    )
+    torch.testing.assert_close(
+        output.mm_items[1].precomputed_embeddings, embeddings[Modality.IMAGE][3:]
+    )
 
 
 def test_kimi_rejects_mismatched_pre_tokenized_image_placeholders():

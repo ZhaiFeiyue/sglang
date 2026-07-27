@@ -430,9 +430,17 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        think_excluded_tokens = [
+            "response",
+            "message",
+            "<|end_of_msg|>",
+            "[EOS]",
+            "[EOT]",
+        ]
         super().__init__(
             "<|open|>think<|sep|>",
             "<|close|>think<|sep|>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token=TOOLS_OPEN,

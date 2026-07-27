@@ -137,14 +137,29 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
 def _resize_bicubic_if_needed(
     image: torch.Tensor, target_height: int, target_width: int
 ) -> torch.Tensor:
+    """Match the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
+
+    Kimi's HF processors only ever downscale (NaViT scale <= 1.0), and PIL's
+    bicubic widens the kernel support by the scale factor, i.e. it always
+    antialiases; ``F.interpolate`` needs ``antialias=True`` to do the same.
+    PIL also returns uint8, so quantize the resized result back to integer
+    pixel values before normalization (round-to-nearest, clipped to [0, 255]);
+    without this the float overshoot leaks past the [-1, 1] range the model
+    was trained on.
+    """
     image = image.float()
     if image.shape[-2:] == (target_height, target_width):
         return image
-    return F.interpolate(
-        image,
-        size=(target_height, target_width),
-        mode="bicubic",
-        align_corners=False,
+    return (
+        F.interpolate(
+            image,
+            size=(target_height, target_width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+        .round_()
+        .clamp_(0.0, 255.0)
     )
 
 

@@ -50,6 +50,7 @@ TOPK_CAPS_EXPECTED=$(grep -Eci "kNumMaxTop[Kk] = (9|11|16)" csrc/kernels/interno
   exit 1
 }
 sed -i 's/constexpr int kNumMaxTopK = 11;/constexpr int kNumMaxTopK = 16;/' csrc/kernels/internode_ll.cu
+sed -i 's/constexpr int kNumMaxTopK = 9;/constexpr int kNumMaxTopK = 16;/'  csrc/kernels/internode_ll.cu
 sed -i 's/constexpr int kNumMaxTopk = 9;/constexpr int kNumMaxTopk = 16;/'  csrc/kernels/internode_ll.cu
 sed -i 's/constexpr int kNumMaxTopk = 11;/constexpr int kNumMaxTopk = 16;/' csrc/kernels/internode_ll.cu
 TOPK_CAPS_PATCHED=$(grep -ci "kNumMaxTop[Kk] = 16" csrc/kernels/internode_ll.cu || true)

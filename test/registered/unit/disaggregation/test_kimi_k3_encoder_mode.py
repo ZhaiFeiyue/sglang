@@ -18,6 +18,7 @@ from PIL import Image
 from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     MMReceiverHTTP,
+    MultiModalEmbeddingData,
     WaitingImageRequest,
     _select_mm_processor_prompt,
 )
@@ -111,7 +112,7 @@ def test_kimi_k3_encoder_normalizes_pillow_images_to_media_dicts():
 
 
 def test_kimi_k3_encoder_passes_media_dicts_to_image_processor():
-    image = Image.new("RGB", (2, 2))
+    image = Image.new("RGB", (3, 2))
     processor_calls = []
 
     def image_processor(*, images, **kwargs):
@@ -129,11 +130,42 @@ def test_kimi_k3_encoder_passes_media_dicts_to_image_processor():
         encoder.preproc_executor.shutdown()
 
     assert "pixel_values" in output
+    assert output["original_image_sizes"] == [[3, 2]]
     assert len(processor_calls) == 1
     images, kwargs = processor_calls[0]
     assert images[0]["type"] == "image"
     assert images[0]["image"] is image
     assert kwargs == {"return_tensors": "pt"}
+
+
+def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
+    first = EmbeddingData(
+        req_id="request",
+        num_parts=2,
+        part_idx=0,
+        grid_dim=torch.tensor([[1, 2, 6]]),
+        modality=Modality.IMAGE,
+        embedding=torch.ones(3, 4),
+        original_image_sizes=[[1536, 1024]],
+    )
+    second = EmbeddingData(
+        req_id="request",
+        num_parts=2,
+        part_idx=1,
+        grid_dim=torch.tensor([[1, 2, 4]]),
+        modality=Modality.IMAGE,
+        embedding=torch.ones(2, 4),
+        original_image_sizes=[[1024, 1536]],
+    )
+
+    combined = MultiModalEmbeddingData.from_embedding_data(first, model_type="kimi_k3")
+    combined.add(second)
+
+    assert combined.ready
+    assert combined.get_mm_extra_meta()["original_image_sizes"] == [
+        [1536, 1024],
+        [1024, 1536],
+    ]
 
 
 def test_kimi_k3_encoder_prefers_grid_thws_and_uses_temporal_pool_length():

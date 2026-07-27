@@ -251,10 +251,29 @@ def _normalize_aux_value(val):
 
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
-    return {
+    aux = {
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
     }
+    if model_type == "kimi_k3":
+        aux["original_image_sizes"] = _normalize_aux_value(
+            mm_inputs.get("original_image_sizes")
+        )
+    return aux
+
+
+def _get_original_image_size(image):
+    """Return an image's original (width, height) before encoder preprocessing."""
+    if isinstance(image, dict):
+        image = image.get("image")
+    if isinstance(image, torch.Tensor):
+        if image.ndim < 2:
+            raise ValueError(f"Invalid image tensor shape: {tuple(image.shape)}")
+        return [int(image.shape[-1]), int(image.shape[-2])]
+    if hasattr(image, "size"):
+        width, height = image.size
+        return [int(width), int(height)]
+    raise TypeError(f"Cannot determine original image size from {type(image)}")
 
 
 class MMEncoder:
@@ -1595,12 +1614,16 @@ class MMEncoder:
         if model_preprocessor:
             return model_preprocessor(images, Modality.IMAGE, self.vision_config)
         image_config = self.vision_config.get("image", {})
+        original_image_sizes = [_get_original_image_size(item) for item in images]
         if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-        return await asyncio.get_running_loop().run_in_executor(
+        processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
         )
+        if self.model_type == "kimi_k3":
+            processor_input["original_image_sizes"] = original_image_sizes
+        return processor_input
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
@@ -2146,7 +2169,7 @@ class MMEncoder:
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
-            aux_data = _build_mm_aux_data(mm_inputs)
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
 
             # Setup metadata and event management
             nbytes, total_tokens, embedding_dim, event = (
@@ -2304,14 +2327,17 @@ class MMEncoder:
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
-            # No aux_data here: batch_encode only handles IMAGE/AUDIO
-            # (_BATCHABLE_MODALITIES), and _build_mm_aux_data only extracts
-            # video-meta fields — which never appear in image/audio mm_inputs.
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
             results = []
             offset = 0
             for req, n in zip(requests, items_per_req):
                 slices = final_slices[offset : offset + n]
                 emb = slices[0] if n == 1 else torch.cat(slices, dim=0)
+                req_aux_data = {}
+                if aux_data.get("original_image_sizes") is not None:
+                    req_aux_data["original_image_sizes"] = aux_data[
+                        "original_image_sizes"
+                    ][offset : offset + n]
                 if self.rank == 0:
                     self.embedding_to_send[req["req_id"]] = EmbeddingData(
                         req["req_id"],
@@ -2320,6 +2346,7 @@ class MMEncoder:
                         grid_dim[offset : offset + n],
                         modality,
                         emb,
+                        **req_aux_data,
                     )
                 results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
                 offset += n

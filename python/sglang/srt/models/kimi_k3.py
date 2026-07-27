@@ -145,25 +145,26 @@ def _k3_bf16_gemm(
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
     shared down GEMM call torch directly on raw merged weights, so the
-    --bf16-gemm-backend cutedsl selection would silently skip them.
-
-    TGV has no out= form; the copy into `out` (a contiguous view of the
-    concat-allreduce buffer) is [T, H] at decode sizes and only taken when
-    the heuristic already judged the TGV win larger."""
+    --bf16-gemm-backend cutedsl selection would silently skip them."""
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
         if get_bf16_gemm_backend().is_cutedsl():
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 cutedsl_bf16_gemm,
+                cutedsl_bf16_gemm_out,
                 use_cutedsl_bf16_gemm,
             )
 
             if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
-                y = cutedsl_bf16_gemm(x, weight)
                 if out is None:
-                    return y
-                out.copy_(y)
+                    return cutedsl_bf16_gemm(x, weight)
+                if out.is_contiguous():
+                    # TGV stores straight into caller memory (same entry the
+                    # UnquantizedLinearMethod out-buffer path uses); no
+                    # staging tensor + copy.
+                    return cutedsl_bf16_gemm_out(x, weight, out)
+                out.copy_(cutedsl_bf16_gemm(x, weight))
                 return out
     if out is None:
         return torch.nn.functional.linear(x, weight)

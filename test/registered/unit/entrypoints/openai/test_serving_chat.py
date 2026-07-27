@@ -197,7 +197,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         conv_mock.assert_not_called()
 
-    def test_kimi_k3_separates_adjacent_image_placeholders(self):
+    def test_kimi_k3_keeps_adjacent_image_placeholders_adjacent(self):
         image_data = []
         message = {
             "role": "user",
@@ -214,7 +214,6 @@ class ServingChatTestCase(unittest.TestCase):
             flattened["content"],
             [
                 {"type": "image_url", "image_url": {"url": "image-1"}},
-                {"type": "text", "text": "\n"},
                 {"type": "image_url", "image_url": {"url": "image-2"}},
                 {"type": "text", "text": "Compare them."},
             ],
@@ -261,6 +260,29 @@ class ServingChatTestCase(unittest.TestCase):
                 "text": "<|media_pad|> Describe it.",
             },
         )
+
+    def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "image_tokens": 2035,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2072)
+        self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
 
     def test_kimi_k3_rejects_internal_placeholder_in_user_text(self):
         message = {

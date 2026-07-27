@@ -35,9 +35,102 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 )
 
 
+def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
+    """Encode K3 control tokens without allowing them to be BPE-split."""
+    try:
+        return list(tokenizer.encode(text, allowed_special="all"))
+    except TypeError:
+        # Keep the helper usable with lightweight tokenizer stubs in CPU tests.
+        return list(tokenizer.encode(text))
+
+
+def _expand_k3_image_prompt_token_ids(
+    input_ids: Union[List[int], torch.Tensor],
+    image_token_id: int,
+    image_token_counts: List[int],
+    image_sizes: List[tuple[int, int]],
+    tokenizer,
+) -> torch.Tensor:
+    """Expand K3 image placeholders into the checkpoint's media contract.
+
+    K3 requires each image feature span to be enclosed by its original uploaded
+    dimensions.  The chat template deliberately emits one ``media_pad`` per
+    image; after decode, insert the surrounding control tokens and expand that
+    one placeholder to the NaViT feature count.
+    """
+    if len(image_token_counts) != len(image_sizes):
+        raise ValueError("Expected one original size for each K3 image.")
+
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.detach().flatten().cpu().numpy()
+    input_ids = np.asarray(input_ids, dtype=np.int64)
+
+    placeholder_count = np.count_nonzero(input_ids == image_token_id)
+    if placeholder_count != len(image_token_counts):
+        raise ValueError(
+            f"Expected {len(image_token_counts)} image placeholder token(s), "
+            f"found {placeholder_count}."
+        )
+
+    output = []
+    image_index = 0
+    for token_id in input_ids:
+        if token_id != image_token_id:
+            output.append(int(token_id))
+            continue
+
+        width, height = image_sizes[image_index]
+        output.extend(
+            _encode_k3_special_tokens(
+                tokenizer,
+                f"<|media_begin|>image {width}x{height}<|media_content|>",
+            )
+        )
+        output.extend([image_token_id] * image_token_counts[image_index])
+        output.extend(_encode_k3_special_tokens(tokenizer, "<|media_end|>"))
+        image_index += 1
+
+    return torch.tensor(output, dtype=torch.long).unsqueeze(0)
+
+
+def _expand_k3_image_prompt_text(
+    input_text: str,
+    image_token: str,
+    image_token_counts: List[int],
+    image_sizes: List[tuple[int, int]],
+) -> str:
+    """Render the K3 media framing for the CPU HF-processor fallback."""
+    parts = input_text.split(image_token)
+    if len(parts) - 1 != len(image_token_counts):
+        raise ValueError(
+            f"Expected {len(image_token_counts)} image placeholder(s), "
+            f"found {len(parts) - 1}."
+        )
+
+    output = [parts[0]]
+    for image_token_count, (width, height), suffix in zip(
+        image_token_counts, image_sizes, parts[1:]
+    ):
+        output.extend(
+            (
+                f"<|media_begin|>image {width}x{height}<|media_content|>",
+                image_token * image_token_count,
+                "<|media_end|>",
+                suffix,
+            )
+        )
+    return "".join(output)
+
+
 def _k3_to_cuda_chw(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     if isinstance(image, Image.Image):
-        has_alpha = "A" in image.getbands() or "transparency" in image.info
+        # The checkpoint's fill_transparent_bg_with() returns RGB-mode images
+        # untouched before it ever inspects the alpha bands, so an RGB image
+        # carrying a stray "transparency" info key must NOT be promoted to
+        # RGBA here.
+        has_alpha = image.mode != "RGB" and (
+            "A" in image.getbands() or "transparency" in image.info
+        )
         arr = np.asarray(image.convert("RGBA" if has_alpha else "RGB"))
         return torch.from_numpy(arr).permute(2, 0, 1).cuda()
 
@@ -88,7 +181,10 @@ def _fill_transparent_bg(x: torch.Tensor, bg_cfg: Union[dict, None]) -> torch.Te
         raise ValueError(f"Invalid background pattern: {pattern}")
 
     alpha = (x[:, 3:4] / 255.0).clamp(0.0, 1.0)
-    return (alpha * rgb + (1.0 - alpha) * bg).clamp(0.0, 255.0)
+    # The checkpoint processor casts the composited float result back with
+    # numpy's astype(np.uint8), which truncates; floor matches that exactly
+    # (a composite of [0, 255] inputs is always non-negative).
+    return (alpha * rgb + (1.0 - alpha) * bg).clamp(0.0, 255.0).floor_()
 
 
 class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
@@ -96,12 +192,37 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         super().__init__(*args, **kwargs)
         self._transparent_bg_config = transparent_bg_config
 
+    def _prepare_input_ids(
+        self, input_text, resize_configs, original_input_ids, image_sizes
+    ):
+        image_token_counts = [config["num_tokens"] for config in resize_configs]
+        if original_input_ids is None:
+            original_input_ids = _encode_k3_special_tokens(
+                self._hf_processor.tokenizer, input_text
+            )
+        return _expand_k3_image_prompt_token_ids(
+            original_input_ids,
+            self._image_token_id,
+            image_token_counts,
+            image_sizes,
+            self._hf_processor.tokenizer,
+        )
+
+    def __call__(self, text=None, images=None, **kwargs):
+        images = images or kwargs.pop("images", None)
+        original_input_ids = kwargs.pop("sglang_original_input_ids", None)
+        if images and torch.cuda.is_available():
+            return self._gpu_call(text, images, original_input_ids)
+        return self._cpu_call(text, images, original_input_ids, **kwargs)
+
     def _gpu_call(self, text, images, original_input_ids=None):
         input_text = text[0] if isinstance(text, list) else text
 
         resize_configs = []
+        image_sizes = []
         for image in images:
             w, h = _get_image_dimensions(image)
+            image_sizes.append((w, h))
             resize_configs.append(
                 navit_resize_config(
                     w,
@@ -115,7 +236,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             )
 
         input_ids = self._prepare_input_ids(
-            input_text, resize_configs, original_input_ids
+            input_text, resize_configs, original_input_ids, image_sizes
         )
 
         image_scale, image_bias = self._get_gpu_norm_tensors()
@@ -139,6 +260,38 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             "image_grid_thw": grid_thws,
         }
 
+    def _cpu_call(self, text, images, original_input_ids=None, **kwargs):
+        """HF fallback with the same K3 media framing as the GPU path."""
+        input_text = text[0] if isinstance(text, list) else text
+        if not images:
+            return self._hf_processor(text=[input_text], **kwargs)
+
+        image_sizes = [_get_image_dimensions(image) for image in images]
+        image_token_counts = [
+            self._hf_processor.media_processor.media_tokens_calculator(
+                {"type": "image", "image": image}
+            )
+            for image in images
+        ]
+        expanded_text = _expand_k3_image_prompt_text(
+            input_text,
+            self._image_token,
+            image_token_counts,
+            image_sizes,
+        )
+        kwargs["medias"] = [{"type": "image", "image": image} for image in images]
+        out = self._hf_processor(text=[expanded_text], **kwargs)
+        out["input_ids"] = self._prepare_input_ids(
+            input_text,
+            [{"num_tokens": count} for count in image_token_counts],
+            original_input_ids,
+            image_sizes,
+        )
+        grid_thws = out.pop("grid_thws", None)
+        if grid_thws is not None:
+            out["image_grid_thw"] = grid_thws
+        return out
+
 
 class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK3ForConditionalGeneration]
@@ -148,6 +301,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
+    preserve_processor_input_ids = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
@@ -238,9 +392,36 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
-        return self._build_kimi_mm_data_from_grids(
+        output = self._build_kimi_mm_data_from_grids(
             prompt=prompt,
             embeddings=embeddings,
             image_token_id=self.mm_tokens.image_token_id,
             img_grid_thw=img_grid_thw,
         )
+        image_sizes = kwargs.get("original_image_sizes")
+        if image_sizes is None:
+            return output
+
+        counts = [self._num_image_tokens_from_grid(grid) for grid in img_grid_thw]
+        if len(image_sizes) != len(counts):
+            raise ValueError(
+                "Expected one original image size for each K3 encoder grid."
+            )
+        output.input_ids = (
+            _expand_k3_image_prompt_token_ids(
+                prompt,
+                self.mm_tokens.image_token_id,
+                counts,
+                [tuple(size) for size in image_sizes],
+                self._tokenizer,
+            )
+            .flatten()
+            .tolist()
+        )
+
+        search_start = 0
+        for item, count in zip(output.mm_items, counts):
+            start = output.input_ids.index(self.mm_tokens.image_token_id, search_start)
+            item.offsets = [(start, start + count - 1)]
+            search_start = start + count
+        return output
