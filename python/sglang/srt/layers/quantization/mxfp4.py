@@ -146,6 +146,7 @@ if TYPE_CHECKING:
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -433,9 +434,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # naive-copy fast path is correct.
             intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         elif _use_aiter:
-
+            # Expert intermediate is padded to 128 or 256. On K3 (TP8) the 256
+            # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
+            # 128 padding, so relaxing to 128 saves that memory and lets the TP8
+            # decode CUDA graph range grow from 20 to 120.
+            _inter_align = 128 if _aiter_k3_opt else 256
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, 256
+                intermediate_size_per_partition, _inter_align
             )
 
             hidden_size = round_up(hidden_size, 256)
@@ -478,16 +483,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         w13_weight_scale.quant_method = "group"
 
-        w13_weight_bias = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_bias", w13_weight_bias)
-        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+        create_bias = with_bias or not _is_hip
+        if create_bias:
+            w13_weight_bias = torch.nn.Parameter(
+                torch.zeros(
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
@@ -515,12 +522,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         w2_weight_scale.quant_method = "group"
 
-        w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_bias", w2_weight_bias)
-        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        if create_bias:
+            w2_weight_bias = torch.nn.Parameter(
+                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
@@ -816,35 +824,52 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return
         if _use_aiter:
-            if layer.w13_weight_bias is not None:
+            if getattr(layer, "w13_weight_bias", None) is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
                     torch.float32
                 )
-            if layer.w2_weight_bias is not None:
+            if getattr(layer, "w2_weight_bias", None) is not None:
                 layer.w2_weight_bias.data = layer.w2_weight_bias.data.to(torch.float32)
 
             e, n, k = layer.w13_weight.shape
-            layer.w13_weight.view(torch.uint8).copy_(
-                layer.w13_weight.data.view(torch.uint8)
-                .view(e, n // 2, 2, k)
-                .permute(0, 2, 1, 3)
-                .contiguous()
-                .view(e, n, k)
-            )
-            layer.w13_weight_scale.data = (
-                layer.w13_weight_scale.data.view(e, n // 2, 2, -1)
-                .permute(0, 2, 1, 3)
-                .contiguous()
-                .view(e, n, -1)
-            )
-            layer.w13_weight_bias.data = (
-                layer.w13_weight_bias.data.view(-1, n // 2, 2)
-                .permute(0, 2, 1)
-                .contiguous()
-                .view(-1, n)
+            gate_up_interleaved = getattr(
+                layer.moe_runner_config, "gate_up_interleaved", True
             )
 
-            if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get():
+            if gate_up_interleaved:
+                layer.w13_weight.view(torch.uint8).copy_(
+                    layer.w13_weight.data.view(torch.uint8)
+                    .view(e, n // 2, 2, k)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                    .view(e, n, k)
+                )
+                layer.w13_weight_scale.data = (
+                    layer.w13_weight_scale.data.view(e, n // 2, 2, -1)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                    .view(e, n, -1)
+                )
+                if getattr(layer, "w13_weight_bias", None) is not None:
+                    layer.w13_weight_bias.data = (
+                        layer.w13_weight_bias.data.view(-1, n // 2, 2)
+                        .permute(0, 2, 1)
+                        .contiguous()
+                        .view(-1, n)
+                    )
+
+            k3_situ_a8w4 = (
+                os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+                and getattr(layer.moe_runner_config, "activation", None) == "situ"
+            )
+            use_aiter_gu_interleave = (
+                k3_situ_a8w4
+                or (
+                    envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    and gate_up_interleaved
+                )
+            )
+            if use_aiter_gu_interleave:
                 layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
                 shuffled_w13_scale = shuffle_scale_a16w4(
                     layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
@@ -1126,10 +1151,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if moe_runner_backend.is_aiter():
-            # MXFP4 hard-codes Swiglu in the AITER kernel path.
-            self.runner = MoeRunner(
-                moe_runner_backend, replace(moe_runner_config, activation="swiglu")
-            )
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif (
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
@@ -1534,22 +1556,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=AiterQuantType.PER_1X32,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                b13=layer.w13_weight_bias,
-                b2=layer.w2_weight_bias,
+                b13=layer.w13_weight_bias if self.with_bias else None,
+                b2=layer.w2_weight_bias if self.with_bias else None,
                 expert_mask=layer.dispatcher.expert_mask_gpu,
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
-                # Triggers aiter's INTERLEAVE gate_mode dispatch (required for our
-                # preshuffled gate/up-interleaved weight layout) and applies the
-                # model's swiglu clamp. Models populate the same scalar under
-                # different MoeRunnerConfig fields: gpt-oss uses `gemm1_clamp_limit`
-                # (renamed in `models/gpt_oss.py` from `config.swiglu_limit`); DSv4
-                # / FP8 uses `swiglu_limit` directly. Accept either.
+                # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
+                # uses gemm1_clamp_limit as linear_beta, which is forwarded by
+                # the AITER runner and must not be treated as swiglu_limit.
                 swiglu_limit=(
-                    self.moe_runner_config.gemm1_clamp_limit
-                    or self.moe_runner_config.swiglu_limit
-                    or 0.0
+                    0.0
+                    if self.moe_runner_config.activation == "situ"
+                    else (
+                        self.moe_runner_config.gemm1_clamp_limit
+                        or self.moe_runner_config.swiglu_limit
+                        or 0.0
+                    )
                 ),
             )
             return self.runner.run(
