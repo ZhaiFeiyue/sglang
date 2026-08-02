@@ -1411,6 +1411,26 @@ class MoriKVManager(CommonKVManager):
             self.kv_args, buffer_index, aux_index, data
         )
 
+    def peer_requires_dcp_relayout(self, bootstrap_room: int) -> bool:
+        """True if this request's KV transfer will use the token-granular DCP
+        relayout: TP-only prefill (dcp_size==1) sending to a DCP-sharded decode
+        (dst_dcp_size>1) for an (hybrid-)MLA layout. The relayout builds one
+        per-rank plan over the full sequence, so the cached-prefix early-send must
+        be skipped (it would split the transfer and drop the newly-computed tail)."""
+        if not (
+            self.dcp_size == 1 and (self.is_mla_backend or self.is_hybrid_mla_backend)
+        ):
+            return False
+        with self.transfer_lock:
+            infos = self.transfer_infos.get(bootstrap_room)
+            if not infos:
+                return False
+            for info in infos.values():
+                peer = self.decode_kv_args_table.get(info.engine_key)
+                if peer is not None and peer.dst_dcp_size > 1:
+                    return True
+        return False
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -1547,6 +1567,9 @@ class MoriKVSender(CommonKVSender):
         self._notify_lock = threading.Lock()
         self._notified_status: Optional[KVPoll] = None
         self._notified_reason: Optional[str] = None
+
+    def requires_dcp_relayout(self) -> bool:
+        return self.kv_mgr.peer_requires_dcp_relayout(self.bootstrap_room)
 
     def send(
         self,
