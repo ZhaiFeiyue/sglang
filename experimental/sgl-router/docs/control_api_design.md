@@ -32,12 +32,12 @@ This design adds a **`/control/*` control plane** to sgl-router that:
 
 | Capability | mori-sched | sgl-router today | this design |
 |---|---|---|---|
-| Fleet cache flush | `/cache/flush` | `POST /flush_cache` | keep + `GET /control/cache/status`, per-worker |
-| Router profiling toggle | `POST /profile/control` | — | `POST /control/profile` |
-| Profiling stats / dump | `/profile/stats`, `/profile/dump` | — | `GET /control/profile/stats`, `/control/profile/dump` |
+| Fleet cache flush | `/cache/flush` | `POST /flush_cache` | `GET`/`DELETE /control/cache` + per-worker |
+| Router profiling toggle | `POST /profile/control` | — | `PUT /control/profiling {enabled}` |
+| Profiling stats / dump | `/profile/stats`, `/profile/dump` | — | `GET /control/profiling/{stats,records}` |
 | Per-worker GPU/torch profile | `/workers/:id/profile/{start,stop}` | — | proxy → engine `/start_profile` `/stop_profile` |
-| Runtime log level | `GET/PUT /router/config/log-level` | — | `GET/PUT /control/log-level` |
-| Config reload | `POST /router/config/reload` | — | `POST /control/config/reload` (P3, best-effort) |
+| Runtime log level | `GET/PUT /router/config/log-level` | — | `GET/PUT /control/config/log-level` |
+| Config reload | `POST /router/config/reload` | — | `POST /control/config:reload` (P3, best-effort) |
 | Cluster status | `/cluster/status`, `/workers` | (partly via `/metrics`) | `GET /control/status`, `/control/workers` |
 | Trace collector | `mori-trace` binary | — | reuse `mori-trace` (it just scrapes `/metrics`); optional `sgl-trace` later |
 
@@ -61,40 +61,76 @@ This design adds a **`/control/*` control plane** to sgl-router that:
    `cache::fan_out_flush`'s pattern (breaker-bypass, per-worker result).
 5. **Measurement/ops-only.** No routing/placement/eviction decisions here.
 
-## 4. API surface
+## 4. RESTful API specification
 
-Base: `/control` (guarded). `{id}` is a `WorkerId` from the registry.
+Resource-oriented, not RPC. Nouns for resources; verbs carry the intent:
+**GET** read, **PUT** idempotent set-state, **DELETE** remove/clear, **POST**
+only for non-idempotent actions that don't map to a resource verb.
 
-### 4.1 Diagnostics (read-only)
-| Method | Path | Body / Query | Returns |
+### 4.0 Conventions
+- Base path `/control`; all endpoints require `Authorization: Bearer <token>`.
+- Request/response bodies are JSON (`application/json`).
+- Error body: `{ "error": "<code>", "detail": "<human message>" }`.
+- Status codes: `200` OK · `202` Accepted (async/fan-out kicked off) · `204` No
+  Content · `400` bad body · `401` unauthorized · `404` unknown resource ·
+  `409` conflict (illegal state transition) · `502` upstream worker error ·
+  `503` not ready.
+- Fleet (multi-worker) operations return per-worker results and use `200` when
+  all succeeded, `502` when any worker failed (with the per-worker breakdown in
+  the body) — mirrors today's `/flush_cache`.
+- `{id}` is a `WorkerId` from the registry.
+
+### 4.1 Cluster (read-only)
+| Verb | Resource | → |
+|---|---|---|
+| `GET` | `/control/status` | `200` `{version, uptime_s, ready, models:[{id,policy}], workers:{prefill,decode,plain,total}}` |
+
+### 4.2 Workers (read-only collection)
+| Verb | Resource | → |
+|---|---|---|
+| `GET` | `/control/workers` | `200` `[{id,url,mode,healthy,cb_state,inflight,model_ids}]` |
+| `GET` | `/control/workers/{id}` | `200` worker object · `404` |
+| `GET` | `/control/workers/{id}/load` | `200` `{id,prefill_tokens,decode_blocks,inflight}` · `404` |
+
+### 4.3 Router-side profiling (singleton resource + records sub-collection)
+`profiling` is a resource whose `enabled` state you **set** (idempotent), and
+whose captured `records` are a sub-collection you read or clear.
+
+| Verb | Resource | Body | → |
 |---|---|---|---|
-| GET | `/control/status` | — | cluster snapshot: router version, uptime, policy per model, worker count by mode, ready flag |
-| GET | `/control/workers` | — | `[{id, url, mode, healthy, cb_state, inflight, model_ids}]` |
-| GET | `/control/workers/{id}/load` | — | `{id, prefill_tokens, decode_blocks, inflight}` |
+| `GET` | `/control/profiling` | — | `200` `{enabled, since, record_count}` |
+| `PUT` | `/control/profiling` | `{"enabled": true｜false}` | `200` `{enabled, since, record_count}` (idempotent start/stop) · `400` |
+| `GET` | `/control/profiling/records` | `?last_n=N` (query) | `200` `{records:[…]}` |
+| `DELETE` | `/control/profiling/records` | — | `204` (cleared) |
+| `GET` | `/control/profiling/stats` | — | `200` aggregated snapshot |
 
-### 4.2 Profiling
-| Method | Path | Body | Effect |
-|---|---|---|---|
-| POST | `/control/profile` | `{"action":"start"｜"stop"｜"clear"}` | toggle **router-side** capture (e.g. enable the session-signal collectors / an in-memory ring buffer) at runtime |
-| GET | `/control/profile/stats` | — | aggregated router-side profiling snapshot (JSON) |
-| GET | `/control/profile/dump` | `?last_n=N` | recent N per-request/session records (JSON) |
-| POST | `/control/workers/{id}/profile/start` | `{...ProfileReq}` | proxy → engine `POST /start_profile` |
-| POST | `/control/workers/{id}/profile/stop` | — | proxy → engine `POST /stop_profile` |
-| POST | `/control/gpu_profile/{start,stop}` | `{worker?, ...}` | fan-out torch profiler to all (or one) worker |
+*(Replaces the RPC `POST /profile {action}`: start/stop → `PUT …/profiling`,
+clear → `DELETE …/profiling/records`, dump → `GET …/profiling/records`.)*
 
-### 4.3 Runtime config
-| Method | Path | Body | Effect |
-|---|---|---|---|
-| GET | `/control/log-level` | — | current tracing filter directive |
-| PUT | `/control/log-level` | `{"level":"debug"｜"info,sgl_router::policies=trace"}` | live `EnvFilter` reload (no restart) |
-| POST | `/control/config/reload` | — | **P3**, best-effort re-read of worker list / policy tuning |
+### 4.4 Per-worker GPU/torch profiling (sub-resource; proxied to engine)
+Model each worker's profiler as a `profiling` sub-resource; `PUT enabled` proxies
+to the engine's `/start_profile` / `/stop_profile`.
 
-### 4.4 Cache
-| Method | Path | Body | Effect |
+| Verb | Resource | Body | → |
 |---|---|---|---|
-| POST | `/control/cache/flush` | — | fleet flush (alias of today's `/flush_cache`) |
-| GET | `/control/cache/status` | — | per-worker cache status (proxy → engine, best-effort) |
-| POST | `/control/workers/{id}/cache/flush` | — | flush one worker |
+| `PUT` | `/control/workers/{id}/profiling` | `{"enabled":true, ...profile_opts}` / `{"enabled":false}` | `200` `{id,enabled}` · `404` · `502` |
+| `PUT` | `/control/workers/profiling` | `{"enabled":bool, ...}` | `200` `{results:[{id,ok}]}` · `502` (fleet) |
+
+### 4.5 Runtime config
+| Verb | Resource | Body | → |
+|---|---|---|---|
+| `GET` | `/control/config/log-level` | — | `200` `{level}` |
+| `PUT` | `/control/config/log-level` | `{"level":"info,sgl_router::policies=trace"}` | `200` `{level}` · `400` (live `EnvFilter` reload, no restart) |
+| `POST` | `/control/config:reload` | — | `202` `{reloaded:true,...}` — **P3**, non-idempotent action (re-read workers/policy tuning) |
+
+### 4.6 Cache
+Flushing a cache = removing cached representations → `DELETE`.
+
+| Verb | Resource | → |
+|---|---|---|
+| `GET` | `/control/cache` | `200` per-worker cache status (proxy, best-effort) |
+| `DELETE` | `/control/cache` | `200` `{results:[{id,ok}]}` · `502` (fleet flush; supersedes `POST /flush_cache`, which stays as a back-compat alias) |
+| `DELETE` | `/control/workers/{id}/cache` | `200` · `404` · `502` (one worker) |
 
 ## 5. Architecture
 
@@ -127,31 +163,32 @@ classDiagram
     }
     class LogLevelEndpoints {
         -reload_handle: tracing_subscriber reload::Handle
-        +GET/PUT /control/log-level
+        +GET/PUT /control/config/log-level
     }
     class ProfileEndpoints {
         -profiler: Arc~ProfileController~
-        +POST /control/profile
-        +GET /control/profile/stats|dump
+        +PUT /control/profiling
+        +GET /control/profiling/stats|records
+        +DELETE /control/profiling/records
     }
     class WorkerProfileProxy {
         -proxy: Arc~Proxy~
         -registry: Arc~WorkerRegistry~
-        +/control/workers/:id/profile/*
-        +/control/gpu_profile/*
+        +PUT /control/workers/:id/profiling
+        +PUT /control/workers/profiling
     }
     class CacheEndpoints {
-        +/control/cache/flush|status
-        +/control/workers/:id/cache/flush
+        +GET/DELETE /control/cache
+        +DELETE /control/workers/:id/cache
     }
 
     class ProfileController {
         -enabled: AtomicBool
         -ring: Mutex~RingBuffer~Record~~
-        +set(action)
+        +set(enabled: bool)
         +record(r)
         +stats() Json
-        +dump(last_n) Json
+        +records(last_n) Json
     }
 
     class AppContext {
@@ -218,17 +255,17 @@ sequenceDiagram
     participant PC as ProfileController
     participant Chat as chat_completions
 
-    Op->>Auth: POST /control/profile {action:start} (Bearer)
+    Op->>Auth: PUT /control/profiling {enabled:true} (Bearer)
     Auth->>PE: authorized
-    PE->>PC: set(Start)  (enabled=true)
+    PE->>PC: set(true)  (enabled=true)
     Note over Chat,PC: while enabled, the request path records into the ring
     Chat->>PC: record(per-request/session sample)
-    Op->>Auth: GET /control/profile/dump?last_n=100 (Bearer)
+    Op->>Auth: GET /control/profiling/records?last_n=100 (Bearer)
     Auth->>PE: authorized
-    PE->>PC: dump(100)
-    PC-->>Op: JSON [ …recent samples… ]
-    Op->>Auth: POST /control/profile {action:stop}
-    Auth->>PE: set(Stop) (enabled=false)
+    PE->>PC: records(100)
+    PC-->>Op: 200 {records:[ …recent samples… ]}
+    Op->>Auth: PUT /control/profiling {enabled:false}
+    Auth->>PE: set(false) (enabled=false)
 ```
 
 ### 5.4 Sequence — per-worker GPU/torch profile (proxy to engine)
@@ -240,13 +277,13 @@ sequenceDiagram
     participant Reg as WorkerRegistry
     participant Eng as SGLang engine
 
-    Op->>WP: POST /control/workers/p0/profile/start {ProfileReq}
+    Op->>WP: PUT /control/workers/p0/profiling {enabled:true, ...opts}
     WP->>Reg: get("p0") → Worker{url}
     WP->>Eng: POST {url}/start_profile {ProfileReq}
     Eng-->>WP: 200
-    WP-->>Op: {worker:"p0", ok:true}
+    WP-->>Op: 200 {id:"p0", enabled:true}
     Note over Op,Eng: later
-    Op->>WP: POST /control/workers/p0/profile/stop
+    Op->>WP: PUT /control/workers/p0/profiling {enabled:false}
     WP->>Eng: POST {url}/stop_profile
     Eng-->>WP: 200 (trace written on the engine host)
 ```
@@ -259,7 +296,7 @@ sequenceDiagram
     participant LL as LogLevelEndpoints
     participant H as tracing reload::Handle
 
-    Op->>LL: PUT /control/log-level {level:"info,sgl_router::policies=trace"}
+    Op->>LL: PUT /control/config/log-level {level:"info,sgl_router::policies=trace"}
     LL->>H: reload(EnvFilter::new(level))
     H-->>LL: ok
     LL-->>Op: {applied:"info,sgl_router::policies=trace"}
@@ -298,24 +335,24 @@ Control endpoints change runtime behavior and can start profilers on GPUs, so:
 ## 7. Phasing
 
 - **P1 (core, low-risk):** `ControlPlane` + `AuthLayer` + enable flag/token;
-  `GET /control/status`, `/control/workers`; `GET/PUT /control/log-level`
-  (reload handle in `main.rs`); `POST /control/cache/flush` (alias existing
+  `GET /control/status`, `/control/workers`; `GET/PUT /control/config/log-level`
+  (reload handle in `main.rs`); `DELETE /control/cache` (reuses existing
   fan-out). No engine changes.
-- **P2 (profiling):** `ProfileController` + `POST /control/profile`,
-  `/control/profile/{stats,dump}`; per-worker proxy
-  `/control/workers/:id/profile/{start,stop}` + `/control/gpu_profile/*` →
-  engine `/start_profile` `/stop_profile`.
-- **P3 (config reload):** best-effort `/control/config/reload` (re-read worker
-  URLs / policy tuning). Bounded scope; may stay out if risky.
+- **P2 (profiling):** `ProfileController` + `PUT /control/profiling` +
+  `GET /control/profiling/{stats,records}` + `DELETE /control/profiling/records`;
+  per-worker proxy `PUT /control/workers/:id/profiling` → engine
+  `/start_profile` `/stop_profile`.
+- **P3 (config reload):** best-effort `POST /control/config:reload` (re-read
+  worker URLs / policy tuning). Bounded scope; may stay out if risky.
 
 ## 8. Files (when implemented — not in this branch)
 
 ```
 server/control/mod.rs           ControlEndpoint trait + ControlPlane + AuthLayer
 server/control/diagnostics.rs   /control/status, /workers, /workers/:id/load
-server/control/log_level.rs     /control/log-level (needs reload handle)
-server/control/profile.rs       ProfileController + /control/profile*
-server/control/worker_proxy.rs  /control/workers/:id/profile|cache, /gpu_profile
+server/control/log_level.rs     /control/config/log-level (needs reload handle)
+server/control/profile.rs       ProfileController + /control/profiling*
+server/control/worker_proxy.rs  /control/workers/:id/profiling, /control/workers/:id/cache
 server/app.rs                   nest ControlPlane router when enabled
 main.rs                         reload-layer subscriber; build ControlPlane
 config/cli.rs, config/types.rs  --enable-control-api, --control-addr, token(env)
@@ -325,7 +362,7 @@ config/cli.rs, config/types.rs  --enable-control-api, --control-addr, token(env)
 
 - No scheduling/placement/eviction logic — ops/observability only.
 - Auth is a static bearer token (env). mTLS / RBAC is out of scope.
-- `/control/config/reload` scope (workers only? policies too?) — TBD in P3.
+- `POST /control/config:reload` scope (workers only? policies too?) — TBD in P3.
 - Whether to reuse the data port (nested router + auth) or require
   `--control-addr` in production — default: same port + auth; recommend separate
   bind for exposed deployments.
