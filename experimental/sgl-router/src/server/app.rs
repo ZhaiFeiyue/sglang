@@ -72,9 +72,14 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
+        // Back-compat fleet flush. Accept GET and POST to match the legacy
+        // API / the engine's own `/flush_cache` (methods=["GET","POST"]) so
+        // existing clients using either verb keep working. The per-worker
+        // `/workers/{id}/cache/clean` below is additive, not a replacement.
         .route(
             "/flush_cache",
-            post(crate::server::routes::cache::flush_cache),
+            get(crate::server::routes::cache::flush_cache)
+                .post(crate::server::routes::cache::flush_cache),
         )
         // Per-worker admin (v1): profiling start/end + cache clean — proxied to
         // the addressed worker's engine.

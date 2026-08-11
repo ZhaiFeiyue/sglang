@@ -255,6 +255,24 @@ mod tests {
         (status, body)
     }
 
+    /// Back-compat: the legacy `/flush_cache` must also answer GET (the engine
+    /// and old router expose it as GET|POST), not just POST.
+    #[tokio::test]
+    async fn get_flush_cache_is_supported_for_back_compat() {
+        let app = crate::server::app::build_router(Arc::new(AppContext::stub()));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/flush_cache")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn all_workers_succeed_returns_200() {
         let (u1, _s1) = spawn_fake_flush_worker(StatusCode::OK).await;
