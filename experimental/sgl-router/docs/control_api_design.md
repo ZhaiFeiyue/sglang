@@ -32,7 +32,7 @@ This design adds a **`/control/*` control plane** to sgl-router that:
 
 | Capability | mori-sched | sgl-router today | this design |
 |---|---|---|---|
-| Fleet cache flush | `/cache/flush` | `POST /flush_cache` | `GET`/`DELETE /control/cache` + per-worker |
+| Fleet cache flush | `/cache/flush` | `POST /flush_cache` | `GET /control/cache`, `POST /control/cache/clean` + per-worker |
 | Router profiling toggle | `POST /profile/control` | — | `PUT /control/profiling {enabled}` |
 | Profiling stats / dump | `/profile/stats`, `/profile/dump` | — | `GET /control/profiling/{stats,records}` |
 | Per-worker GPU/torch profile | `/workers/:id/profile/{start,stop}` | — | proxy → engine `/start_profile` `/stop_profile` |
@@ -60,6 +60,47 @@ This design adds a **`/control/*` control plane** to sgl-router that:
    the engines' existing endpoints via the proxy client, reusing
    `cache::fan_out_flush`'s pattern (breaker-bypass, per-worker result).
 5. **Measurement/ops-only.** No routing/placement/eviction decisions here.
+6. **Clients address logical workers, not physical endpoints.** Everything a
+   client lists or operates on is a *logical worker* keyed by a **stable id**
+   (see §3.1). The router maps that id to whatever physical endpoint currently
+   backs it.
+
+## 3.1 Logical worker identity (stable ids)
+
+Clients only ever see and operate on **logical workers**. Each has an `id` that
+must be **stable across restarts** so an operator can script against
+`/control/workers/{id}/...` and keep hitting the same logical slot even after the
+backing process/pod is replaced.
+
+**Why a new layer is needed** — today's ids are *physical* and not restart-stable:
+- static discovery uses the **raw URL** as the id (`static_urls.rs:41`,
+  `WorkerId(url)`) — changes if the IP/host changes, and is an awkward client key;
+- k8s uses the **pod UID** (`k8s.rs:123`, `{ns}/{uid}`) — a fresh UID every pod
+  incarnation, i.e. it **changes on every restart** (intentionally, to reset the
+  breaker). Good for internal lifecycle, unusable as a stable client handle.
+
+So we separate two identities:
+- **Physical id** (`WorkerId`, unchanged): URL / pod-UID. Drives registry
+  lifecycle, circuit breaker, discovery Add/Remove. May change across restarts.
+- **Logical id** (new, client-facing): a stable slug. The control API's `{id}`
+  is always this. The router keeps a `logical_id ↔ WorkerId` map and resolves it
+  per request; when a pod restarts with a new UID/IP but the same logical id, the
+  client keeps using the same `{id}`.
+
+**Logical id resolution (first match wins):**
+1. **Operator-assigned** — most durable, survives IP/UID changes:
+   - static: `--worker-urls` accepts `id=<url>` (e.g. `prefill-0=http://10.0.0.1:31100`);
+   - k8s: pod label/annotation `sglang.ai/worker-id`.
+2. **k8s StatefulSet pod name** (e.g. `prefill-0`) from `target_ref.name` —
+   stable across restarts (unlike the UID). Preferred default on k8s.
+3. **Deterministic derivation** — `"{role}-{ordinal}"` where `ordinal` is the
+   rank of the worker within its role after a **stable sort of the configured
+   URLs** (host:port). Stable as long as the URL set is unchanged. Fallback:
+   the normalized URL.
+
+This keeps existing internal behavior (breaker/lifecycle keyed by physical
+`WorkerId`) while giving clients a durable handle. `GET /control/workers` returns
+both so the mapping is observable: `{id (logical), url (physical), mode, …}`.
 
 ## 4. RESTful API specification
 
@@ -78,7 +119,8 @@ only for non-idempotent actions that don't map to a resource verb.
 - Fleet (multi-worker) operations return per-worker results and use `200` when
   all succeeded, `502` when any worker failed (with the per-worker breakdown in
   the body) — mirrors today's `/flush_cache`.
-- `{id}` is a `WorkerId` from the registry.
+- `{id}` is the **stable logical worker id** (§3.1), never the raw URL/UID. An
+  unknown id → `404`.
 
 ### 4.1 Cluster (read-only)
 | Verb | Resource | → |
@@ -88,7 +130,7 @@ only for non-idempotent actions that don't map to a resource verb.
 ### 4.2 Workers (read-only collection)
 | Verb | Resource | → |
 |---|---|---|
-| `GET` | `/control/workers` | `200` `[{id,url,mode,healthy,cb_state,inflight,model_ids}]` |
+| `GET` | `/control/workers` | `200` `[{id,url,mode,healthy,cb_state,inflight,model_ids}]` — `id` = stable logical id, `url` = current physical endpoint |
 | `GET` | `/control/workers/{id}` | `200` worker object · `404` |
 | `GET` | `/control/workers/{id}/load` | `200` `{id,prefill_tokens,decode_blocks,inflight}` · `404` |
 
@@ -124,13 +166,15 @@ to the engine's `/start_profile` / `/stop_profile`.
 | `POST` | `/control/config:reload` | — | `202` `{reloaded:true,...}` — **P3**, non-idempotent action (re-read workers/policy tuning) |
 
 ### 4.6 Cache
-Flushing a cache = removing cached representations → `DELETE`.
+Clearing a cache is a proxied **operation** on the worker's cache subsystem (it
+maps to the engine's `POST /flush_cache`), so it's a `POST …/cache/clean` action
+rather than a `DELETE` on a router resource. `GET` reads status.
 
 | Verb | Resource | → |
 |---|---|---|
 | `GET` | `/control/cache` | `200` per-worker cache status (proxy, best-effort) |
-| `DELETE` | `/control/cache` | `200` `{results:[{id,ok}]}` · `502` (fleet flush; supersedes `POST /flush_cache`, which stays as a back-compat alias) |
-| `DELETE` | `/control/workers/{id}/cache` | `200` · `404` · `502` (one worker) |
+| `POST` | `/control/cache/clean` | `200` `{results:[{id,ok}]}` · `502` (fleet; supersedes `POST /flush_cache`, kept as a back-compat alias) |
+| `POST` | `/control/workers/{id}/cache/clean` | `200` `{id,ok}` · `404` · `502` (one worker) |
 
 ## 5. Architecture
 
@@ -178,8 +222,9 @@ classDiagram
         +PUT /control/workers/profiling
     }
     class CacheEndpoints {
-        +GET/DELETE /control/cache
-        +DELETE /control/workers/:id/cache
+        +GET /control/cache
+        +POST /control/cache/clean
+        +POST /control/workers/:id/cache/clean
     }
 
     class ProfileController {
@@ -336,8 +381,8 @@ Control endpoints change runtime behavior and can start profilers on GPUs, so:
 
 - **P1 (core, low-risk):** `ControlPlane` + `AuthLayer` + enable flag/token;
   `GET /control/status`, `/control/workers`; `GET/PUT /control/config/log-level`
-  (reload handle in `main.rs`); `DELETE /control/cache` (reuses existing
-  fan-out). No engine changes.
+  (reload handle in `main.rs`); `POST /control/cache/clean` (reuses existing
+  fan-out); logical-id resolution (§3.1) + `GET /control/workers`. No engine changes.
 - **P2 (profiling):** `ProfileController` + `PUT /control/profiling` +
   `GET /control/profiling/{stats,records}` + `DELETE /control/profiling/records`;
   per-worker proxy `PUT /control/workers/:id/profiling` → engine
@@ -352,7 +397,8 @@ server/control/mod.rs           ControlEndpoint trait + ControlPlane + AuthLayer
 server/control/diagnostics.rs   /control/status, /workers, /workers/:id/load
 server/control/log_level.rs     /control/config/log-level (needs reload handle)
 server/control/profile.rs       ProfileController + /control/profiling*
-server/control/worker_proxy.rs  /control/workers/:id/profiling, /control/workers/:id/cache
+server/control/worker_proxy.rs  /control/workers/:id/profiling, /control/workers/:id/cache/clean
+workers/registry.rs             logical-id ↔ WorkerId map + resolver (§3.1)
 server/app.rs                   nest ControlPlane router when enabled
 main.rs                         reload-layer subscriber; build ControlPlane
 config/cli.rs, config/types.rs  --enable-control-api, --control-addr, token(env)
