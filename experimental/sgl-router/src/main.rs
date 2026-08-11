@@ -175,6 +175,17 @@ async fn main() -> Result<()> {
     );
     ctx.mark_ready();
 
+    // Evict idle sessions from the arrival-rate tracker (bounds the per-session
+    // metric label cardinality). Only spawned when the feature is enabled.
+    let session_arrival_janitor = ctx.session_arrival.as_ref().map(|tracker| {
+        let tracker = Arc::clone(tracker);
+        sgl_router::policies::active_load::spawn_sweeper(
+            move || tracker.sweep(),
+            std::time::Duration::from_secs(60),
+            "session-arrival",
+        )
+    });
+
     let app = sgl_router::server::app::build_router(ctx.clone());
 
     let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
@@ -195,6 +206,9 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     manager_handle.abort();
     janitor_handle.shutdown().await;
+    if let Some(j) = session_arrival_janitor {
+        j.shutdown().await;
+    }
     server_result
 }
 
