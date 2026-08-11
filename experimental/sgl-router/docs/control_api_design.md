@@ -1,9 +1,23 @@
 # Design — sgl-router control / profiling API
 
-> **Status: design only (no implementation in this branch).** This document
-> specifies a control-plane HTTP API for `sgl-router`, aligned with
-> mori-scheduler's profiling/control surface, built on the same self-registration
-> pattern as the pluggable `/metrics` collectors.
+> **v1 shipped in this branch — minimal per-worker admin, no `/control` prefix.**
+> Implemented endpoints (each proxies to the addressed worker's engine):
+>
+> | Method | Path | Engine call |
+> |---|---|---|
+> | POST | `/workers/{id}/profiling/start` | `POST {url}/start_profile` (body forwarded) |
+> | POST | `/workers/{id}/profiling/end` | `POST {url}/stop_profile` |
+> | POST | `/workers/{id}/cache/clean` | `POST {url}/flush_cache` |
+>
+> `{id}` is the registry worker id; `404` unknown id, `200` on 2xx upstream,
+> `502` otherwise. Torch traces are written on the engine host (its `output_dir`
+> / `SGLANG_TORCH_PROFILER_DIR`) — the router only triggers and reports; it does
+> not return trace files (put `output_dir` on a shared mount to collect them).
+> Code: `server/routes/workers_admin.rs`.
+>
+> **The rest of this document (§2–§9) is the broader future design** — the
+> `/control/*` plane, stable logical ids, diagnostics, log-level, mori-trace
+> compat — kept for reference; not yet implemented.
 
 ## 1. Summary
 
