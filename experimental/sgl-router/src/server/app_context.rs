@@ -7,6 +7,7 @@ use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
+use crate::server::metrics_collector::BuildInfoCollector;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +75,13 @@ impl AppContext {
         // after the policy registry, so inject it now. No-op for policies
         // that don't emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
+        // Pluggable collectors self-register here, driven by which features are
+        // active. `build_info` is always-on. Feature-gated collectors register
+        // only when their param made the module live, e.g.:
+        //   if config.model.cache_aware.is_some() { metrics.register_collector(...) }
+        //   if session_stats_enabled { metrics.register_collector(...) }
+        // so `/metrics` reflects exactly the enabled modules.
+        metrics.register_collector(Arc::new(BuildInfoCollector));
         Self {
             config,
             tokenizers,

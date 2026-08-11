@@ -49,6 +49,8 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             }
         })
         .collect();
+    // `render_with_workers` renders the core families plus any pluggable
+    // collectors that modules registered when their feature was enabled.
     let body = ctx.metrics.render_with_workers(&workers);
     (
         StatusCode::OK,
@@ -97,6 +99,41 @@ mod tests {
         assert!(body.contains("# TYPE sgl_router_requests_total counter"));
         assert!(body.contains("# TYPE sgl_router_overlap_blocks histogram"));
         assert!(body.contains("# TYPE sgl_router_active_load gauge"));
+        // No pluggable collector is enabled by default → its series is absent.
+        assert!(
+            !body.contains("sgl_router_build_info"),
+            "build_info must be absent when no collector is enabled",
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_includes_registered_collector() {
+        // A module registers a collector → it auto-appears on /metrics after the
+        // core families (the full pluggable path). stub() registers none, so we
+        // register one explicitly here.
+        let ctx = Arc::new(AppContext::stub());
+        ctx.metrics.register_collector(Arc::new(
+            crate::server::metrics_collector::BuildInfoCollector,
+        ));
+        let app = crate::server::app::build_router(ctx.clone());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("# TYPE sgl_router_build_info gauge"));
+        assert!(
+            body.contains("sgl_router_build_info{version="),
+            "expected build_info series; got:\n{body}",
+        );
+        // Core families still present (collector is additive).
+        assert!(body.contains("# TYPE sgl_router_requests_total counter"));
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@
 //!
 //! The exposition is text/plain; version=0.0.4 per the Prometheus spec.
 
+use crate::server::metrics_collector::MetricCollector;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -225,6 +226,12 @@ pub struct MetricsRegistry {
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// Pluggable collectors registered by active modules (see
+    /// [`crate::server::metrics_collector`]). A module registers its collector
+    /// only when the param that enables its feature / selects it made it live,
+    /// so `/metrics` reflects exactly the enabled modules. Rendered after the
+    /// core families; the registry just formats what each collector emits.
+    collectors: Mutex<Vec<Arc<dyn MetricCollector>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -324,6 +331,14 @@ impl Histogram {
 impl MetricsRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Register a pluggable [`MetricCollector`]. Called by a module when the
+    /// param that enables its feature / selects it made it active, so the
+    /// module's metrics auto-appear on `/metrics`. The registry does not decide
+    /// what to emit — the collector (registrant) owns its series.
+    pub fn register_collector(&self, collector: Arc<dyn MetricCollector>) {
+        self.collectors.lock().push(collector);
     }
 
     /// Bump the edge intake counter `requests_total{route,method}`. Called at the
@@ -804,6 +819,12 @@ impl MetricsRegistry {
             ));
         }
         drop(guard);
+
+        // Pluggable collectors registered by active modules (build_info, session
+        // stats, …). Rendered after the core families; each owns its output.
+        for collector in self.collectors.lock().iter() {
+            collector.render(&mut out);
+        }
 
         out
     }
