@@ -81,8 +81,13 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             get(crate::server::routes::cache::flush_cache)
                 .post(crate::server::routes::cache::flush_cache),
         )
-        // Per-worker admin (v1): profiling start/end + cache clean — proxied to
-        // the addressed worker's engine.
+        // Per-worker admin (v1): list + profiling start/end + cache clean —
+        // workers addressed by a stable integer id (see `workers_admin`),
+        // actions proxied to the addressed worker's engine.
+        .route(
+            "/workers",
+            get(crate::server::routes::workers_admin::list_workers),
+        )
         .route(
             "/workers/{id}/profiling/start",
             post(crate::server::routes::workers_admin::profiling_start),

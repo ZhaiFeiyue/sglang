@@ -1,18 +1,23 @@
 # Design — sgl-router control / profiling API
 
 > **v1 shipped in this branch — minimal per-worker admin, no `/control` prefix.**
-> Implemented endpoints (each proxies to the addressed worker's engine):
+> Implemented endpoints (each action proxies to the addressed worker's engine):
 >
 > | Method | Path | Engine call |
 > |---|---|---|
+> | GET  | `/workers` | — (list `[{id,url,mode}]`) |
 > | POST | `/workers/{id}/profiling/start` | `POST {url}/start_profile` (body forwarded) |
 > | POST | `/workers/{id}/profiling/end` | `POST {url}/stop_profile` |
 > | POST | `/workers/{id}/cache/clean` | `POST {url}/flush_cache` |
 >
-> `{id}` is the registry worker id; `404` unknown id, `200` on 2xx upstream,
+> `{id}` is a **stable integer** (`0,1,2,…`) = the worker's rank when the
+> registry is sorted by URL, so the same URL set yields the same id across
+> restarts (independent of discovery order). `GET /workers` shows the id → url
+> mapping. `400` non-integer id, `404` out-of-range id, `200` on 2xx upstream,
 > `502` otherwise. Torch traces are written on the engine host (its `output_dir`
 > / `SGLANG_TORCH_PROFILER_DIR`) — the router only triggers and reports; it does
 > not return trace files (put `output_dir` on a shared mount to collect them).
+> `/flush_cache` (fleet, GET|POST) is retained for back-compat.
 > Code: `server/routes/workers_admin.rs`.
 >
 > **The rest of this document (§2–§9) is the broader future design** — the
