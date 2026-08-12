@@ -72,9 +72,33 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
+        // Back-compat fleet flush. Accept GET and POST to match the legacy
+        // API / the engine's own `/flush_cache` (methods=["GET","POST"]) so
+        // existing clients using either verb keep working. The per-worker
+        // `/workers/{id}/cache/clean` below is additive, not a replacement.
         .route(
             "/flush_cache",
-            post(crate::server::routes::cache::flush_cache),
+            get(crate::server::routes::cache::flush_cache)
+                .post(crate::server::routes::cache::flush_cache),
+        )
+        // Per-worker admin (v1): list + profiling start/end + cache clean —
+        // workers addressed by a stable integer id (see `workers_admin`),
+        // actions proxied to the addressed worker's engine.
+        .route(
+            "/workers",
+            get(crate::server::routes::workers_admin::list_workers),
+        )
+        .route(
+            "/workers/{id}/profiling/start",
+            post(crate::server::routes::workers_admin::profiling_start),
+        )
+        .route(
+            "/workers/{id}/profiling/end",
+            post(crate::server::routes::workers_admin::profiling_end),
+        )
+        .route(
+            "/workers/{id}/cache/clean",
+            post(crate::server::routes::workers_admin::cache_clean),
         )
         // After routing, so MatchedPath is set for every route.
         .layer(middleware::from_fn_with_state(ctx.clone(), count_requests))
