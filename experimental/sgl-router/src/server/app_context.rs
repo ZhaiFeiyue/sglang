@@ -8,6 +8,7 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
 use crate::server::metrics_collector::BuildInfoCollector;
+use crate::server::session_arrival::{SessionArrivalRateCollector, SessionArrivalTracker};
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +32,11 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
+    /// Per-session arrival-rate tracker. `Some` only when the feature is enabled
+    /// (`SGL_ROUTER_SESSION_ARRIVAL`); the chat handler feeds it on request
+    /// arrival and its collector is registered on `metrics`. See
+    /// [`crate::server::session_arrival`].
+    pub session_arrival: Option<Arc<SessionArrivalTracker>>,
     ready: AtomicBool,
 }
 
@@ -82,6 +88,15 @@ impl AppContext {
         //   if session_stats_enabled { metrics.register_collector(...) }
         // so `/metrics` reflects exactly the enabled modules.
         metrics.register_collector(Arc::new(BuildInfoCollector));
+        // Per-session arrival-rate: enabled via env. When on, the module builds
+        // its tracker and self-registers its collector — the feature drives the
+        // metric's presence on `/metrics`.
+        let session_arrival = SessionArrivalTracker::from_env();
+        if let Some(tracker) = &session_arrival {
+            metrics.register_collector(Arc::new(SessionArrivalRateCollector::new(Arc::clone(
+                tracker,
+            ))));
+        }
         Self {
             config,
             tokenizers,
@@ -90,6 +105,7 @@ impl AppContext {
             policies,
             active_load,
             metrics,
+            session_arrival,
             ready: AtomicBool::new(false),
         }
     }
@@ -135,6 +151,7 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
+            session_arrival: None,
             ready: AtomicBool::new(false),
         }
     }

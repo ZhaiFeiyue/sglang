@@ -8,3 +8,4 @@ pub mod header_utils;
 pub mod metrics;
 pub mod metrics_collector;
 pub mod routes;
+pub mod session_arrival;

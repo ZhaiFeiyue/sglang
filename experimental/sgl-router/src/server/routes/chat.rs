@@ -180,6 +180,11 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
+    // Feed the per-session arrival-rate tracker (measurement-only; enabled via
+    // env). Keyed by the sticky routing key; other policies leave it `None`.
+    if let (Some(tracker), Some(sid)) = (&ctx.session_arrival, routing_key) {
+        tracker.on_recv(sid, start);
+    }
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     let worker =
