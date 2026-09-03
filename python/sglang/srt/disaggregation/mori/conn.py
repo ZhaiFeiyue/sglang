@@ -804,36 +804,44 @@ class MoriKVManager(CommonKVManager):
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
 
-    def _shard_kv_indices_for_mla(
+    def _shard_mla_indices_by_position(
         self,
-        kv_indices: npt.NDArray[np.int32],
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
         page_size: int,
         shard_rank: int,
         shard_size: int,
-    ) -> npt.NDArray[np.int32]:
-        """[scheme-1 Phase A, scaffolding — NOT yet wired into the send path]
+    ) -> Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+        """[scheme-1 Phase B] Keep only the sequence-pages this prefill rank owns.
 
-        MLA replicates the single latent KV head identically across all TP ranks, so
-        each prefill rank currently ships its full (identical) copy -> the same data
-        crosses the network `shard_size` times. This keeps only the pages this rank
-        owns (``(page_id) % shard_size == shard_rank``, pages kept whole), so the 8
-        NICs collectively ship 1x. Decode then reconstructs the full latent via an
-        intra-node all-gather (Phase B, TBD). Measured ~4x raw-transfer speedup.
+        MLA replicates the single latent KV head identically across all TP ranks, and
+        (symmetric TP) prefill rank i pairs 1:1 with decode rank i. Currently rank i
+        ships its FULL latent to decode i -> the full latent crosses the net 8x (once
+        per decode rank). Here rank i ships only pages whose SEQUENCE page number
+        ``(pos // page_size) % shard_size == shard_rank``; decode reconstructs the full
+        latent via an intra-node all-gather (~4x measured raw-transfer speedup).
 
-        Shard by PAGE (token block), NOT by latent dim, so each compressed layer's
-        per-page RDMA message stays intact. Unit-tested in
-        research/experiments/dsv4_ttft/shard_prototype.py (disjoint/complete/balanced).
+        CRITICAL: prefill_kv_indices[j] and dst_kv_indices[j] are POSITIONALLY paired
+        (j-th token). We shard by POSITION j (sequence page), NOT by the physical slot
+        VALUE (paged/radix slots are scattered), and apply the SAME mask to both arrays
+        so the src<->dst pairing stays intact. Pages are kept whole so each compressed
+        c4/c128 layer's per-page RDMA message is unchanged. Unit-tested in
+        research/experiments/dsv4_ttft/shard_prototype.py.
         """
         if shard_size <= 1:
-            return kv_indices
+            return prefill_kv_indices, dst_kv_indices
+        n = int(prefill_kv_indices.shape[0])
+        if n == 0 or dst_kv_indices.shape[0] != n:
+            return prefill_kv_indices, dst_kv_indices
         if shard_rank < 0 or shard_rank >= shard_size:
             logger.warning(
-                f"_shard_kv_indices_for_mla: shard_rank={shard_rank} out of "
+                f"_shard_mla_indices_by_position: shard_rank={shard_rank} out of "
                 f"range [0,{shard_size}); sending no pages"
             )
-            return kv_indices[:0]
-        page_ids = kv_indices // page_size
-        return kv_indices[(page_ids % shard_size) == shard_rank]
+            return prefill_kv_indices[:0], dst_kv_indices[:0]
+        page_no = np.arange(n, dtype=np.int64) // page_size
+        mask = (page_no % shard_size) == shard_rank
+        return prefill_kv_indices[mask], dst_kv_indices[mask]
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
@@ -953,6 +961,19 @@ class MoriKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[TransferStatus]:
+        # [scheme-1 Phase B] MLA replica sharding: ship only this rank's 1/tp of the
+        # sequence-pages (decode reconstructs the rest via intra-node all-gather).
+        # Guarded by mla_shard_enabled (default OFF; only set once the decode-side
+        # all-gather is wired — otherwise decode would be missing 7/8 of the KV).
+        if self.is_mla_backend and getattr(self.kv_args, "mla_shard_enabled", False):
+            local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+            prefill_kv_indices, dst_kv_indices = self._shard_mla_indices_by_position(
+                prefill_kv_indices,
+                dst_kv_indices,
+                self.kv_args.page_size,
+                local_tp_rank,
+                self.attn_tp_size,
+            )
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
                 prefill_kv_indices,
