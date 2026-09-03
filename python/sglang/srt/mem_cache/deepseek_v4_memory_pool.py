@@ -782,6 +782,73 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         return views, item_bytes
 
+    def all_gather_mla_shard(
+        self, req_page_ids, tp_group, tp_rank: int, tp_size: int
+    ) -> None:
+        """[scheme-1 Phase B] Reconstruct the full MLA latent across decode TP ranks.
+
+        With SGLANG_MORI_SHARD_MLA_KV, prefill rank i shipped only the sequence-pages
+        it owns (page p -> owner p % tp_size), so after the RDMA each decode rank holds
+        valid KV only at its owned pages and STALE bytes elsewhere. Here every rank
+        zeros the non-owned pages and all_reduce(SUM)s over the decode-TP group: pages
+        are disjointly owned (exactly one nonzero rank per page), so the fp8/uint8
+        byte-sum reconstructs the full latent on every rank without overflow.
+
+        Relies on dst page slots being identical across decode TP ranks (TP-lockstep
+        allocation); the per-buffer page-count asserts fail loudly if that or the
+        page alignment is violated (rather than silently corrupting KV). Covers the
+        sharded c4 + c128 + c4-indexer buffers; SWA-ring / aux go via unsharded
+        send_state/send_aux and need no aggregation.
+        """
+        import torch
+
+        if tp_size <= 1 or not self._unified_kv:
+            return
+        dev = self.unified_kv_pool.kv_buffer[0].device
+        pages = torch.unique(
+            torch.as_tensor(req_page_ids, device=dev, dtype=torch.long)
+        )
+        if pages.numel() == 0:
+            return
+        non_owned = (pages % tp_size) != tp_rank
+        pg = getattr(tp_group, "device_group", tp_group)
+
+        def _agg(views: List[torch.Tensor]) -> None:
+            if not views:
+                return
+            npages = views[0].shape[0]
+            assert int(pages.max()) < npages, (
+                f"MLA shard all-gather: page {int(pages.max())} >= buffer pages "
+                f"{npages}; page alignment broken, refusing (would corrupt KV)"
+            )
+            # stack layers -> one collective per group: [L, n_req_pages, page_bytes].
+            # Cast uint8 -> int32 for the SUM (RCCL SUM on uint8 is not guaranteed;
+            # pages are disjointly owned so exactly one rank is nonzero per byte ->
+            # no overflow, exact round-trip back to uint8).
+            stacked = torch.stack([v[pages] for v in views], dim=0)
+            stacked[:, non_owned, :] = 0
+            acc = stacked.to(torch.int32)
+            torch.distributed.all_reduce(
+                acc, op=torch.distributed.ReduceOp.SUM, group=pg
+            )
+            stacked = acc.to(torch.uint8)
+            for i, v in enumerate(views):
+                v[pages] = stacked[i]
+
+        c4_views, _ = self.unified_region_buffers(4)
+        c128_views, _ = self.unified_region_buffers(128)
+        idx_views: List[torch.Tensor] = []
+        ref_pages = c4_views[0].shape[0] if c4_views else None
+        for buf in self.c4_indexer_kv_pool.index_k_with_scale_buffer:
+            assert ref_pages is None or buf.shape[0] == ref_pages, (
+                f"MLA shard all-gather: indexer pages {buf.shape[0]} != kv pages "
+                f"{ref_pages}; page alignment broken, refusing (would corrupt KV)"
+            )
+            idx_views.append(buf if buf.dtype == torch.uint8 else buf.view(torch.uint8))
+        _agg(c4_views)
+        _agg(c128_views)
+        _agg(idx_views)
+
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []

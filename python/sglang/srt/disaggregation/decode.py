@@ -2015,6 +2015,34 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    def _maybe_all_gather_mla_shard(self, req: Req) -> None:
+        """[scheme-1 Phase B] Reconstruct the full MLA latent after a sharded transfer.
+
+        With SGLANG_MORI_SHARD_MLA_KV the prefill shipped only 1/tp of the pages to this
+        decode rank; all-reduce over the decode-TP group fills the rest (see
+        DeepSeekV4TokenToKVPool.all_gather_mla_shard). Gathering the whole sequence's
+        pages is correct even for prefix-cached / unsharded pages: they are identical
+        across ranks, so keep-owner + zero-others + sum reproduces the same value.
+        """
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_MORI_SHARD_MLA_KV.get():
+            return
+        pool = self.scheduler.token_to_kv_pool
+        if not hasattr(pool, "all_gather_mla_shard"):
+            return
+        from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+        tp_group = get_attn_tp_group()
+        tp_size = tp_group.world_size
+        if tp_size <= 1:
+            return
+        req_to_token = self.scheduler.req_to_token_pool.req_to_token
+        seq_len = len(req.origin_input_ids)
+        slots = req_to_token[req.req_pool_idx, :seq_len]
+        page_ids = torch.unique(slots // pool.page_size)
+        pool.all_gather_mla_shard(page_ids, tp_group, tp_group.rank_in_group, tp_size)
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
@@ -2088,6 +2116,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                # [scheme-1 Phase B] reconstruct the full MLA latent from the 1/tp
+                # shard each decode rank received (intra-node all-gather over the
+                # decode-TP group). Lockstep: pop_transferred is driven by
+                # poll_and_all_reduce, so all ranks reach this for the same Success
+                # requests in the same order. No-op unless SGLANG_MORI_SHARD_MLA_KV.
+                self._maybe_all_gather_mla_shard(decode_req.req)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(

@@ -333,6 +333,15 @@ class MoriKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        # [scheme-1 Phase B] MLA replica sharding (env-gated, both prefill & decode):
+        # prefill ships only 1/attn_tp of the sequence-pages, decode reconstructs via an
+        # intra-node all-gather. Cuts per-NIC network ~8x. Requires symmetric TP.
+        if self.is_mla_backend and envs.SGLANG_MORI_SHARD_MLA_KV.get():
+            self.kv_args.mla_shard_enabled = True
+            logger.info(
+                f"[scheme-1] MLA KV replica sharding ENABLED (attn_tp={self.attn_tp_size}): "
+                f"prefill ships 1/{self.attn_tp_size} pages; decode all-gathers."
+            )
         self.engine = self._init_engine()
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
