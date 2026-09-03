@@ -2015,32 +2015,43 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _maybe_all_gather_mla_shard(self, req: Req) -> None:
-        """[scheme-1 Phase B] Reconstruct the full MLA latent after a sharded transfer.
+    def _all_gather_mla_shard_batch(self, reqs: List[Req]) -> None:
+        """[scheme-1 Phase B] Reconstruct the full MLA latent for a batch of just-
+        transferred requests via ONE intra-node all-gather over the decode-TP group.
 
-        With SGLANG_MORI_SHARD_MLA_KV the prefill shipped only 1/tp of the pages to this
-        decode rank; all-reduce over the decode-TP group fills the rest (see
-        DeepSeekV4TokenToKVPool.all_gather_mla_shard). Gathering the whole sequence's
-        pages is correct even for prefix-cached / unsharded pages: they are identical
-        across ranks, so keep-owner + zero-others + sum reproduces the same value.
+        With SGLANG_MORI_SHARD_MLA_KV the prefill shipped only 1/tp of the pages to
+        this decode rank; all-reduce over the decode-TP group fills the rest (see
+        DeepSeekV4TokenToKVPool.all_gather_mla_shard). Union all reqs' pages into a
+        single collective — `reqs` is the poll-synced Success set (identical across
+        decode TP ranks), so every rank issues exactly the same collectives in the
+        same order (per-request collectives deadlock under concurrency). Gathering the
+        whole sequence's pages is correct even for prefix-cached / unsharded pages:
+        they are identical across ranks, so keep-owner + zero-others + sum reproduces
+        the same value.
         """
         from sglang.srt.environ import envs
 
         if not envs.SGLANG_MORI_SHARD_MLA_KV.get():
             return
-        pool = self.scheduler.token_to_kv_pool
+        pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
         if not hasattr(pool, "all_gather_mla_shard"):
             return
         from sglang.srt.distributed.parallel_state import get_attn_tp_group
 
         tp_group = get_attn_tp_group()
         tp_size = tp_group.world_size
-        if tp_size <= 1:
+        if tp_size <= 1 or not reqs:
             return
         req_to_token = self.scheduler.req_to_token_pool.req_to_token
-        seq_len = len(req.origin_input_ids)
-        slots = req_to_token[req.req_pool_idx, :seq_len]
-        page_ids = torch.unique(slots // pool.page_size)
+        page_size = pool.page_size
+        page_lists = []
+        for req in reqs:
+            seq_len = len(req.origin_input_ids)
+            slots = req_to_token[req.req_pool_idx, :seq_len]
+            page_lists.append(slots // page_size)
+        if not page_lists:
+            return
+        page_ids = torch.unique(torch.cat(page_lists))
         pool.all_gather_mla_shard(page_ids, tp_group, tp_group.rank_in_group, tp_size)
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
@@ -2063,6 +2074,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
+        mla_shard_success_reqs = []  # [scheme-1] Success reqs to all-gather (batched)
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2116,12 +2128,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
-                # [scheme-1 Phase B] reconstruct the full MLA latent from the 1/tp
-                # shard each decode rank received (intra-node all-gather over the
-                # decode-TP group). Lockstep: pop_transferred is driven by
-                # poll_and_all_reduce, so all ranks reach this for the same Success
-                # requests in the same order. No-op unless SGLANG_MORI_SHARD_MLA_KV.
-                self._maybe_all_gather_mla_shard(decode_req.req)
+                # [scheme-1 Phase B] collect for a SINGLE batched all-gather after the
+                # loop (below). Per-request collectives deadlock under concurrency when
+                # ranks momentarily process different Success subsets; the batched call
+                # over the poll-synced Success set is issued identically by all ranks.
+                mla_shard_success_reqs.append(decode_req.req)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
@@ -2146,6 +2157,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 pass
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+
+        # [scheme-1 Phase B] ONE batched intra-node all-gather over the union of all
+        # Success reqs' pages. mla_shard_success_reqs is the poll-synced Success set,
+        # identical across decode TP ranks, so every rank issues the same collective.
+        self._all_gather_mla_shard_batch(mla_shard_success_reqs)
 
         for i in indices_to_remove:
             if self.enable_staging and self.staging_handler.is_staging_room(
