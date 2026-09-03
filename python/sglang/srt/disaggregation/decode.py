@@ -2042,6 +2042,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         tp_size = tp_group.world_size
         if tp_size <= 1 or not reqs:
             return
+        # Use a DEDICATED communicator (not the model's attn_tp group): issuing the
+        # reconstruction collective on the model's NCCL comm deadlocks under load
+        # because it interleaves with the model's overlapped / cuda-graph collectives
+        # on the shared communicator. A separate comm is ordered independently — the
+        # decode ranks only need to call it in lockstep (guaranteed by the poll-synced
+        # Success set). Created lazily; all ranks reach here together.
+        if getattr(self, "_mla_shard_pg", None) is None:
+            self._mla_shard_pg = torch.distributed.new_group(
+                ranks=tp_group.ranks, backend="nccl"
+            )
         req_to_token = self.scheduler.req_to_token_pool.req_to_token
         page_size = pool.page_size
         page_lists = []
@@ -2052,7 +2062,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not page_lists:
             return
         page_ids = torch.unique(torch.cat(page_lists))
-        pool.all_gather_mla_shard(page_ids, tp_group, tp_group.rank_in_group, tp_size)
+        pool.all_gather_mla_shard(
+            page_ids, self._mla_shard_pg, tp_group.rank_in_group, tp_size
+        )
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
